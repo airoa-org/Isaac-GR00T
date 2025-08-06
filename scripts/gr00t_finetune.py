@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Literal
 
+import wandb
 import torch
 import tyro
 from transformers import TrainingArguments
@@ -32,6 +33,10 @@ from gr00t.model.gr00t_n1 import GR00T_N1_5
 from gr00t.model.transforms import EMBODIMENT_TAG_MAPPING
 from gr00t.utils.peft import get_lora_model
 
+wandb.init(
+    project="gr00t",
+    entity="airoa-aist"
+)
 
 @dataclass
 class ArgsConfig:
