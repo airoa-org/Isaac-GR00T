@@ -77,6 +77,7 @@ class HSRLcmServer:
                 "joint_state": np.array(joint_state, dtype=np.float32),
                 "instruction": request.instruction,
             }
+            #print(observation)
 
             action = self.policy.act(observation)
 
@@ -136,17 +137,16 @@ class Gr00tHSRPolicy:
             "action.head": deque(maxlen=self.adopted_action_chunks),
             "action.base": deque(maxlen=self.adopted_action_chunks),   
         }
+        #print(self.action_queue)
         self.num_traj = num_traj
         rand_img = np.random.randint(0, 256, (256, 256, 3), dtype=np.uint8)
         policy_input = {
             "head_rgb": rand_img,
             "hand_rgb": rand_img,
-            "state.arm": np.array([0.0 for _ in range(5)]),
-            "state.hand": np.array([0.0 for _ in range(1)]),
-            "state.head": np.array([0.0 for _ in range(2)]),
-            "prompt": "Test prompt. Do not move.",
+            "joint_state": np.array([0.0 for _ in range(8)]),
+            "instruction": "Test prompt. Do not move.",
         }
-        self.reset_buffer()
+        #self.reset_buffer()
     
     def reset_buffer(self):
         self.action_queue.clear()
@@ -177,7 +177,7 @@ class Gr00tHSRPolicy:
                 "base_t",
             ]
         """
-
+        #print(self.action_queue)
         if len(self.action_queue["action.arm"]) >= self.num_traj:
             actions = []
             for _ in range(self.num_traj):
@@ -204,19 +204,17 @@ class Gr00tHSRPolicy:
         video_head = np.expand_dims(obs["head_rgb"], axis=0)
         video_hand = np.expand_dims(obs["hand_rgb"], axis=0)
         state_arm = np.expand_dims(obs["joint_state"][:5], axis=0)  # armの状態
-        state_hand = np.expand_dims(obs["joint_state"][5:6], axis=0)  # handの状態
+        state_hand = np.expand_dims(np.expand_dims(obs["joint_state"][5], axis=0), axis=0)  # handの状態
         state_head = np.expand_dims(obs["joint_state"][6:8], axis=0)  # headの状態
         instruction = [obs["instruction"]]  # タスクの説明
         policy_input = {
             "video.head": video_head,
             "video.hand": video_hand,
             "state.arm" : state_arm,  # armの状態
-            "state.wrist": state_wrist,  # wristの状態
             "state.hand": state_hand,  # handの状態
             "state.head": state_head,
             "annotation.human.task_description": instruction,  # タスクの説明
         }
-
         action_chunk = self.policy.get_action(policy_input)
         
         self.action_queue["action.arm"].extend(action_chunk["action.arm"][self.num_traj:self.adopted_action_chunks])
@@ -253,13 +251,24 @@ def main():
     print("Start Issac-GR00T")
 
     # TODO: 引数でいい感じに処理するようにする
-    checkpoint_dir = "/home/veluga-g3/airoa/ckpts"
+    checkpoint_dir = "/home/veluga-g3/airoa/gr00t-tmc-20000"
     adopted_action_chunks = 15
 
     print(f"checkpoint_dir: {checkpoint_dir}")
     print(f"adopted_action_chunks: {adopted_action_chunks}")
 
     policy = Gr00tHSRPolicy(model_path=checkpoint_dir,adopted_action_chunks=adopted_action_chunks)
+
+    # rand_img = np.random.randint(0, 256, (480, 640, 3), dtype=np.uint8)
+    # policy_input = {
+    #     "head_rgb": rand_img,
+    #     "hand_rgb": rand_img,
+    #     "joint_state": np.array([0.0 for _ in range(8)]),
+    #     "instruction": "Test prompt. Do not move.",
+    # }
+    # action = policy.act(policy_input)
+    # print(action)
+
     lcm_hsr_server = HSRLcmServer(policy)
 
     print("start server...")
