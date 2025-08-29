@@ -115,6 +115,9 @@ class LeRobotSingleDataset(Dataset):
         video_backend: str = "decord",
         video_backend_kwargs: dict | None = None,
         transforms: ComposedModalityTransform | None = None,
+        include_episodes: set[int] | None = None,
+        sample_every_n: int | None = None,
+        target_fps: float | None = None,
     ):
         """
         Initialize the dataset.
@@ -146,6 +149,11 @@ class LeRobotSingleDataset(Dataset):
         else:
             self.tag = embodiment_tag
 
+        self.target_fps = target_fps
+        self.sample_every_n = sample_every_n
+
+        
+        self.include_episodes = include_episodes
         self._metadata = self._get_metadata(EmbodimentTag(self.tag))
         self._trajectory_ids, self._trajectory_lengths = self._get_trajectories()
         self._all_steps = self._get_all_steps()
@@ -268,10 +276,11 @@ class LeRobotSingleDataset(Dataset):
         """
 
         # 1. Modality metadata
-        modality_meta_path = self.dataset_path / LE_ROBOT_MODALITY_FILENAME
-        assert (
-            modality_meta_path.exists()
-        ), f"Please provide a {LE_ROBOT_MODALITY_FILENAME} file in {self.dataset_path}"
+        #modality_meta_path = self.dataset_path / LE_ROBOT_MODALITY_FILENAME
+        modality_meta_path = "/home/group_25b505/group_6/workspace/user_00031_25b505/Isaac-GR00T/modality.json"
+        #assert (
+        #    modality_meta_path.exists()
+        #), f"Please provide a {LE_ROBOT_MODALITY_FILENAME} file in {self.dataset_path}"
 
         # 1.1. State and action modalities
         simplified_modality_meta: dict[str, dict] = {}
@@ -315,9 +324,10 @@ class LeRobotSingleDataset(Dataset):
             # NOTE(FH): different lerobot dataset versions have different keys for the number of channels and fps
             try:
                 channels = le_video_meta["shape"][le_video_meta["names"].index("channel")]
-                fps = le_video_meta["video_info"]["video.fps"]
+                #fps = le_video_meta["video_info"]["video.fps"]
+                fps = le_video_meta["info"]["video.fps"]
             except (ValueError, KeyError):
-                # channels = le_video_meta["shape"][le_video_meta["names"].index("channels")]
+                #channels = le_video_meta["shape"][le_video_meta["names"].index("channels")]
                 channels = le_video_meta["info"]["video.channels"]
                 fps = le_video_meta["info"]["video.fps"]
             simplified_modality_meta["video"][new_key] = {
@@ -325,9 +335,12 @@ class LeRobotSingleDataset(Dataset):
                 "channels": channels,
                 "fps": fps,
             }
+        
+        self.fps = fps
 
         # 2. Dataset statistics
-        stats_path = self.dataset_path / LE_ROBOT_STATS_FILENAME
+        #stats_path = self.dataset_path / LE_ROBOT_STATS_FILENAME
+        stats_path = "/home/group_25b505/group_6/workspace/user_00031_25b505/Isaac-GR00T/stats.json"
         try:
             with open(stats_path, "r") as f:
                 le_statistics = json.load(f)
@@ -366,39 +379,94 @@ class LeRobotSingleDataset(Dataset):
 
         return metadata
 
+    # def _get_trajectories(self) -> tuple[np.ndarray, np.ndarray]:
+    #     """Get the trajectories in the dataset."""
+    #     # Get trajectory lengths, IDs, and whitelist from dataset metadata
+    #     episode_path = self.dataset_path / LE_ROBOT_EPISODE_FILENAME
+    #     with open(episode_path, "r") as f:
+    #         episode_metadata = [json.loads(line) for line in f]
+    #     trajectory_ids = []
+    #     trajectory_lengths = []
+    #     for episode in episode_metadata:
+    #         trajectory_ids.append(episode["episode_index"])
+    #         trajectory_lengths.append(episode["length"])
+    #     return np.array(trajectory_ids), np.array(trajectory_lengths)
+
     def _get_trajectories(self) -> tuple[np.ndarray, np.ndarray]:
-        """Get the trajectories in the dataset."""
-        # Get trajectory lengths, IDs, and whitelist from dataset metadata
         episode_path = self.dataset_path / LE_ROBOT_EPISODE_FILENAME
-        with open(episode_path, "r") as f:
-            episode_metadata = [json.loads(line) for line in f]
         trajectory_ids = []
         trajectory_lengths = []
-        for episode in episode_metadata:
-            trajectory_ids.append(episode["episode_index"])
-            trajectory_lengths.append(episode["length"])
+        with open(episode_path, "r") as f:
+            for line in f:
+                ep = json.loads(line)
+                ep_idx = int(ep["episode_index"])
+                if self.include_episodes is not None and ep_idx not in self.include_episodes:
+                    continue
+                trajectory_ids.append(ep_idx)
+                trajectory_lengths.append(int(ep["length"]))
         return np.array(trajectory_ids), np.array(trajectory_lengths)
 
+    # def _get_all_steps(self) -> list[tuple[int, int]]:
+    #     """Get the trajectory IDs and base indices for all steps in the dataset.
+
+    #     Returns:
+    #         list[tuple[str, int]]: A list of (trajectory_id, base_index) tuples.
+
+    #     Example:
+    #         self.trajectory_ids: [0, 1, 2]
+    #         self.trajectory_lengths: [3, 2, 4]
+    #         return: [
+    #             ("traj_0", 0), ("traj_0", 1), ("traj_0", 2),
+    #             ("traj_1", 0), ("traj_1", 1),
+    #             ("traj_2", 0), ("traj_2", 1), ("traj_2", 2), ("traj_2", 3)
+    #         ]
+    #     """
+    #     all_steps: list[tuple[int, int]] = []
+    #     for trajectory_id, trajectory_length in zip(self.trajectory_ids, self.trajectory_lengths):
+    #         for base_index in range(trajectory_length):
+    #             all_steps.append((trajectory_id, base_index))
+    #     return all_steps
+
     def _get_all_steps(self) -> list[tuple[int, int]]:
-        """Get the trajectory IDs and base indices for all steps in the dataset.
-
-        Returns:
-            list[tuple[str, int]]: A list of (trajectory_id, base_index) tuples.
-
-        Example:
-            self.trajectory_ids: [0, 1, 2]
-            self.trajectory_lengths: [3, 2, 4]
-            return: [
-                ("traj_0", 0), ("traj_0", 1), ("traj_0", 2),
-                ("traj_1", 0), ("traj_1", 1),
-                ("traj_2", 0), ("traj_2", 1), ("traj_2", 2), ("traj_2", 3)
-            ]
-        """
+        """(trajectory_id, base_index) の列挙を、必要なら間引いて返す"""
         all_steps: list[tuple[int, int]] = []
+
+        # 1) 等間引きが指定されていれば速い
+        if self.sample_every_n is not None and self.sample_every_n > 1:
+            for trajectory_id, traj_len in zip(self.trajectory_ids, self.trajectory_lengths):
+                for base_index in range(0, int(traj_len), self.sample_every_n):
+                    all_steps.append((int(trajectory_id), int(base_index)))
+            return all_steps
+
+        # 2) target_fps に基づく時間間引き
+        if self.target_fps is not None and self.target_fps > 0:
+            # 各トラジェクトリの timestamp からインデックスを選ぶ
+            for trajectory_id, traj_len in zip(self.trajectory_ids, self.trajectory_lengths):
+                # parquet を1本読むが、キャッシュが効くのでOK
+                df = self.get_trajectory_data(int(trajectory_id))
+                assert "timestamp" in df.columns, "timestamp カラムが必要です"
+                ts = np.asarray(df["timestamp"], dtype=np.float64)
+                # 秒系で来ている想定。ナノ秒等なら適宜スケール調整。
+                period = 1.0 / float(self.target_fps)
+                picked = []
+                last_t = -np.inf
+                for idx, t in enumerate(ts):
+                    if t - last_t >= period or idx == 0:
+                        picked.append(idx)
+                        last_t = t
+                for base_index in picked:
+                    all_steps.append((int(trajectory_id), int(base_index)))
+            return all_steps
+
+        # 3) 間引きなし（従来動作）
         for trajectory_id, trajectory_length in zip(self.trajectory_ids, self.trajectory_lengths):
-            for base_index in range(trajectory_length):
-                all_steps.append((trajectory_id, base_index))
+            for base_index in range(int(trajectory_length)):
+                all_steps.append((int(trajectory_id), int(base_index)))
+
+        
         return all_steps
+
+    
 
     def _get_modality_keys(self) -> dict:
         """Get the modality keys for the dataset.
@@ -415,15 +483,20 @@ class LeRobotSingleDataset(Dataset):
         delta_indices: dict[str, np.ndarray] = {}
         for config in self.modality_configs.values():
             for key in config.modality_keys:
-                delta_indices[key] = np.array(config.delta_indices)
+                ind = np.array(config.delta_indices)
+                if self.sample_every_n is not None:
+                    delta_indices[key] = self.dilate_delta_indices(ind, stride=self.sample_every_n)
+                else:
+                    delta_indices[key] = ind
         return delta_indices
 
     def _get_lerobot_modality_meta(self) -> LeRobotModalityMetadata:
         """Get the metadata for the LeRobot dataset."""
-        modality_meta_path = self.dataset_path / LE_ROBOT_MODALITY_FILENAME
-        assert (
-            modality_meta_path.exists()
-        ), f"Please provide a {LE_ROBOT_MODALITY_FILENAME} file in {self.dataset_path}"
+        #modality_meta_path = self.dataset_path / LE_ROBOT_MODALITY_FILENAME
+        modality_meta_path = "/home/group_25b505/group_6/workspace/user_00031_25b505/Isaac-GR00T/modality.json"
+        #assert (
+        #    modality_meta_path.exists()
+        #), f"Please provide a {LE_ROBOT_MODALITY_FILENAME} file in {self.dataset_path}"
         with open(modality_meta_path, "r") as f:
             modality_meta = LeRobotModalityMetadata.model_validate(json.load(f))
         return modality_meta
@@ -505,7 +578,49 @@ class LeRobotSingleDataset(Dataset):
             dict: The data for the step.
         """
         trajectory_id, base_index = self.all_steps[index]
-        return self.transforms(self.get_step_data(trajectory_id, base_index))
+        out = self.transforms(self.get_step_data(trajectory_id, base_index))
+        #out["episode_index"] = trajectory_id
+        return out
+
+    def dilate_delta_indices(self, delta_indices, stride: int):
+        return np.array([x * stride for x in delta_indices])
+
+    def _debug_get_episode_index(self, trajectory_id: int) -> int:
+        for attr in (
+            "_trajectory_id_to_episode_index",
+            "_trajectory_to_episode",
+            "trajectory_id_to_episode_index",
+            "trajectory_to_episode",
+        ):
+            mapping = getattr(self, attr, None)
+            if isinstance(mapping, (list, tuple)):
+                try:
+                    return int(mapping[trajectory_id])
+                except Exception:
+                    pass
+            if isinstance(mapping, dict):
+                if trajectory_id in mapping:
+                    return int(mapping[trajectory_id])
+
+        trajs = getattr(self, "_trajectories", None)
+        if isinstance(trajs, list) and 0 <= trajectory_id < len(trajs):
+            tr = trajs[trajectory_id]
+            if isinstance(tr, dict):
+                for k in ("episode_index", "episode_id", "episode"):
+                    if k in tr:
+                        return int(tr[k])
+
+        # 3) LeRobot系：trajectory-task のペア配列がある場合
+        pairs = getattr(self, "_trajectory_task_pairs", None)
+        if isinstance(pairs, list) and 0 <= trajectory_id < len(pairs):
+            try:
+                ep_idx = pairs[trajectory_id][0]
+                return int(ep_idx)
+            except Exception:
+                pass
+
+        # 4) それでも無ければ、最終手段：trajectory_id をそのまま返す
+        return int(trajectory_id)
 
     def get_step_data(self, trajectory_id: int, base_index: int) -> dict:
         """Get the RAW data for a single step in a trajectory. No transforms are applied.
@@ -540,6 +655,22 @@ class LeRobotSingleDataset(Dataset):
             # Get the data corresponding to each key in the modality
             for key in self.modality_keys[modality]:
                 data[key] = self.get_data_by_modality(trajectory_id, modality, key, base_index)
+
+        #import sys; sys.exit()
+
+
+        #print("gggggggggggg")
+        #data["episode_index"] = int(self._trajectories[trajectory_id].get("episode_index", trajectory_id))
+        #data["meta"] = {
+        #    "episode_index": int(trajectory_id),
+        #    "__debug_frame_start": int(base_index),
+        #    "__debug_window_len": int(getattr(self, "state_horizon", 0)),
+        #}
+        # 互換性のため top-level も置いておく（既存の sample["episode_index"] を壊さない）
+        #data["episode_index"] = int(trajectory_id)
+        #data["episode_index"] = self._debug_get_episode_index(trajectory_id)
+        #data["__debug_frame_start"] = int(base_index)
+        #data["__debug_window_len"] = int(self.state_horizon if hasattr(self, "state_horizon") else 0)
         return data
 
     def get_trajectory_data(self, trajectory_id: int) -> pd.DataFrame:
@@ -650,8 +781,8 @@ class LeRobotSingleDataset(Dataset):
             np.ndarray: The video frames for the trajectory and frame indices. Shape: (T, H, W, C)
         """
         # Get the step indices
-        step_indices = self.delta_indices[key] + base_index
-        # print(f"{step_indices=}")
+        step_indices = np.array(self.delta_indices[key]) + base_index
+        #print(f"{key}:{step_indices=}")
         # Get the trajectory index
         trajectory_index = self.get_trajectory_index(trajectory_id)
         # Ensure the indices are within the valid range
@@ -699,7 +830,8 @@ class LeRobotSingleDataset(Dataset):
             np.ndarray: The data for the trajectory and step indices.
         """
         # Get the step indices
-        step_indices = self.delta_indices[key] + base_index
+        step_indices = np.array(self.delta_indices[key]) + base_index
+        #print(f"{key}:{step_indices=}")
         # Get the trajectory index
         trajectory_index = self.get_trajectory_index(trajectory_id)
         # Get the maximum length of the trajectory
@@ -752,7 +884,8 @@ class LeRobotSingleDataset(Dataset):
         """
         assert self.curr_traj_data is not None, f"No data found for {trajectory_id=}"
         # Get the step indices
-        step_indices = self.delta_indices[key] + base_index
+        step_indices = np.array(self.delta_indices[key]) + base_index
+        #print(f"{key}:{step_indices=}")
         # Get the trajectory index
         trajectory_index = self.get_trajectory_index(trajectory_id)
         # Get the maximum length of the trajectory
@@ -854,7 +987,7 @@ class CachedLeRobotSingleDataset(LeRobotSingleDataset):
         self.start_indices = np.cumsum(self.trajectory_lengths) - self.trajectory_lengths
 
     def get_video(self, trajectory_id: int, key: str, base_index: int) -> np.ndarray:
-        step_indices = self.delta_indices[key] + base_index
+        step_indices = np.array(self.delta_indices[key]) + base_index
         # Get the trajectory index
         trajectory_index = self.get_trajectory_index(trajectory_id)
         # Ensure the indices are within the valid range

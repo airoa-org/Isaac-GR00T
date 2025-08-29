@@ -67,6 +67,7 @@ class DualBrainTrainer(transformers.Trainer):
 
     def _get_train_sampler(self):
         return BaseSampler(self.train_dataset, shuffle=True, seed=self.args.seed)
+        #return BaseSampler(self.train_dataset, shuffle=False, seed=self.args.seed)
 
     def _get_eval_sampler(self, eval_dataset):
         return BaseSampler(eval_dataset, shuffle=False)

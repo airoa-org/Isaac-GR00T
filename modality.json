@@ -1,0 +1,39 @@
+{
+    "state": {
+        "arm": {
+            "original_key": "observation.state",
+            "start": 0,
+            "end": 5
+        },
+        "gripper": {
+            "original_key": "observation.state",
+            "start": 5,
+            "end": 6
+        },
+        "head": {
+            "original_key": "observation.state",
+            "start": 6,
+            "end": 8
+        }
+    },
+    "action": {
+        "relative": {
+            "original_key": "action.relative",
+            "start": 0,
+            "end": 11
+        }
+    },
+    "video": {
+        "head": {
+            "original_key": "observation.image.head"
+        },
+        "hand": {
+            "original_key": "observation.image.hand"
+        }
+    },
+    "annotation": {
+        "human.task_description": {
+            "original_key": "task_index"
+        }
+    }
+}

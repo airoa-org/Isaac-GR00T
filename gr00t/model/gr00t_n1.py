@@ -180,6 +180,7 @@ class GR00T_N1_5(PreTrainedModel):
         return action_head_outputs
 
     def prepare_input(self, inputs) -> Tuple[BatchFeature, BatchFeature]:
+        inputs = {k: v for k, v in inputs.items() if not k.startswith("__debug_")}
         self.validate_inputs(inputs)
         backbone_inputs = self.backbone.prepare_input(inputs)
         action_inputs = self.action_head.prepare_input(inputs)
