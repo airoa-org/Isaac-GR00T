@@ -118,7 +118,7 @@ class Gr00tHSRPolicy:
         self,
         model_path: str = "/home/veluga-g3/airoa/gr00t-microwave", 
         adopted_action_chunks: int = 15,
-        num_traj: int = 1
+        num_traj: int = 4
     ):
         assert num_traj <= adopted_action_chunks, "num_traj must be <= adopted_action_chunks"
         self.dagtconfig = data_config = DATA_CONFIG_MAP["hsr_v2"]
@@ -154,9 +154,10 @@ class Gr00tHSRPolicy:
         self.temporal_half_life = 8        # フレーム半減期(=約10ステップで重み半減)
         self._ema_action = None
 
-        self.prev_chunk_world = None   # 直近の出力（非正規化＝物理空間）を保存
-        self.s_min_ratio = 0.5         # s_min = H * 0.5 くらいから
-        self.mask_lambda = 0.3         # 中間の指数減衰
+        self.prev_chunk_world = None     # 前チャンク（非正規化/ロボット座標系）
+        self.exec_since_prev = 0        # 前チャンクのうち既に実行したステップ数 d
+        self.s_min_ratio = 0.5           # 末尾自由区間の下限比
+        self.mask_lambda = 0.3
         self.rtc_beta = 5.0
         self.rtc_guidance_clip = 1.0
     
@@ -165,150 +166,90 @@ class Gr00tHSRPolicy:
         
 
     def act(self, obs: dict[str, Any]) -> np.ndarray:
-        """
-        obs: Dict[str, Any]
-            センサ情報
-            {
-                "head_rgb": <np.ndarray shape (H, W, 3)>,
-                "hand_rgb": <np.ndarray shape (H, W, 3)>,
-                "joint_state": <np.ndarray shape (8,)>, # ["arm_lift_joint", "arm_flex_joint", "arm_roll_joint", "wrist_flex_joint", "wrist_roll_joint","hand_motor_joint(gripper)", "head_pan_joint", "head_tilt_joint"]
-                "instruction": <str>,
-            }
-        return: np.ndarray : shape (11,)
-            アクション
-            [
-                "arm_lift_joint",
-                "arm_flex_joint",
-                "arm_roll_joint",
-                "wrist_flex_joint",
-                "wrist_roll_joint",
-                "gripper",
-                "head_pan_joint",
-                "head_tilt_joint",
-                "base_x",
-                "base_y",
-                "base_t",
-            ]
-        """
-        #print(self.action_queue)
-        if len(self.action_queue["action.relative"]) >= self.num_traj:
-            actions = []
-            for _ in range(self.num_traj):
-                action_relative = self.action_queue["action.relative"].popleft()
-                #action_relative = self.actions_rel[self.frame_num]
-                action = np.concatenate(
-                    [
-                        action_relative[0:5],
-                        [action_relative[5]],
-                        #action_relative[7:9],
-                        #action_relative[9:12],
-                        action_relative[6:8],
-                        #[0,0],
-                        action_relative[8:11],
-                    ]
-                )
-                self.frame_num += 1
-
-                action = action + np.concatenate(
-                    [obs["joint_state"][:5], np.array([0]), obs["joint_state"][6:8], np.array([0, 0, 0])]
-                )
-
-                if self.use_temp_ensem:
-                    # half-life から EMA 係数 α を算出
-                    alpha = 1.0 - np.exp(-np.log(2) / max(1e-6, self.temporal_half_life))
-                    if self._ema_action is None:
-                        self._ema_action = action.astype(np.float64)
-                    else:
-                        self._ema_action = alpha * action + (1.0 - alpha) * self._ema_action
-                    action = self._ema_action
-
-                actions.append(action)
-            return np.stack(actions)
-
-        print("=== Gr00tHSRPolicy: Getting action from policy ===")
-        # image shapeは(480, 640, 3) → (1, 480, 640, 3)
+        # 1) 入力の整形はそのまま
         video_head = np.expand_dims(obs["head_rgb"], axis=0)
         video_hand = np.expand_dims(obs["hand_rgb"], axis=0)
-        state_arm = np.expand_dims(obs["joint_state"][:5], axis=0)  # armの状態
-        state_hand = np.expand_dims(np.expand_dims(obs["joint_state"][5], axis=0), axis=0)  # handの状態
-        state_head = np.expand_dims(obs["joint_state"][6:8], axis=0)  # headの状態
-        instruction = [obs["instruction"]]  # タスクの説明
+        state_arm  = np.expand_dims(obs["joint_state"][:5], axis=0)
+        state_hand = np.expand_dims(np.expand_dims(obs["joint_state"][5], axis=0), axis=0)
+        state_head = np.expand_dims(obs["joint_state"][6:8], axis=0)
+        instruction = [obs["instruction"]]
         policy_input = {
             "video.head": video_head,
             "video.hand": video_hand,
-            "state.arm" : state_arm,  # armの状態
-            "state.gripper": state_hand,  # handの状態
+            "state.arm" : state_arm,
+            "state.gripper": state_hand,
             "state.head": state_head,
-            "annotation.human.task_description": instruction,  # タスクの説明
+            "annotation.human.task_description": instruction,
         }
 
+        # 2) RTC パラメータ（H, D）
         H = self.policy.model.action_head.action_horizon
-        D = self.policy.model.action_head.action_dim
-        #D = 11
+        D = self.policy.model.action_head.action_dim   # 32（Head内部）
         B = 1
         device = self.policy.model.device if hasattr(self.policy.model, "device") else "cuda"
-        dtype  = self.policy.model.action_head.dtype if hasattr(self.policy.model.action_head, "dtype") else torch.float32
+        dtype  = (self.policy.model.action_head.dtype
+                if hasattr(self.policy.model.action_head, "dtype") else torch.float32)
 
-        # 遅延推定：最初は d=0 でOK。慣れてきたら実測δ/Δtで更新してね
-        d_steps = 0
-        s_min = max(1, int(H * self.s_min_ratio))
+        # 3) 遅延 d と 末尾自由 s を決める
+        d_steps = min(self.exec_since_prev, H-1) if (self.prev_chunk_world is not None) else 0
+        s_min   = max(1, int(H * self.s_min_ratio))
         s_steps = max(d_steps, s_min)
 
-        W = self.policy.build_rtc_weight_mask(H, d_steps, s_steps, lam=self.mask_lambda, B=B, D=D, device=device, dtype=dtype)
+        # 4) 時間マスク（先頭=1, 中間=exp減衰, 末尾=0）
+        W_time = self.policy.build_rtc_weight_mask(
+            H=H, d=d_steps, s=s_steps, lam=self.mask_lambda, B=B, D=D, device=device, dtype=dtype
+        )
 
-        # 3) 前チャンク（非正規化＝物理空間）を渡す。最初は None
+        # 5) RTC 入力セット（前チャンクは None ならガイダンス無し）
         rtc = {
-            "rtc_prev_action": self.prev_chunk_world,  # None なら ActionHead はガイダンス無しで動く
-            "rtc_weight_mask": W,
+            "rtc_prev_action": self.prev_chunk_world,   # shape [H, 11]（Policy 側で Transform を通して32に）
+            "rtc_weight_mask": W_time,                  # [1,H,32] or [1,H,1]
             "rtc_beta": self.rtc_beta,
             "rtc_guidance_clip": self.rtc_guidance_clip,
-            # "rtc_angle_indices": [10],  # 角度DoFがあれば指定
+            # "rtc_angle_indices": [10],  # 角度DoFがあれば
         }
 
+        # 6) 毎サイクル再推論（RTCつき）
         action_chunk = self.policy.get_action_rtc(policy_input, rtc)
 
-        action_chunk_world = action_chunk["action.relative"]
+        # 7) 出力＆状態更新
+        #   - action_chunk["action.relative"] は [H,11]（非正規化, 相対指令）想定
+        chunk_rel = action_chunk["action.relative"]   # numpy [H,11] を想定
+        # このサイクルで吐き出すステップ数 = stride
+        stride = self.num_traj
 
-        # 5) 次回のために「非正規化の前チャンク」を保存
-        self.prev_chunk_world = action_chunk_world.copy()
-        
-        self.action_queue["action.relative"].extend(action_chunk["action.relative"][self.num_traj:self.adopted_action_chunks])
-    
-        actions = []
-        for i in range(self.num_traj):
-            action_relative = self.action_queue["action.relative"].popleft()
-            #action_relative = self.actions_rel[self.frame_num]
-            action = np.concatenate(
-                [
-                    action_relative[0:5],
-                    [action_relative[5]],
-                    #action_relative[7:9],
-                    #action_relative[9:12],
-                    action_relative[6:8],
-                    #[0,0],
-                    action_relative[8:11],
-                ]
-            )
-
-            self.frame_num += 1
-
-
-        
-            # 差分になっている行動を元に戻す
-            action = action + np.concatenate(
-                [obs["joint_state"][:5], np.array([0]), obs["joint_state"][6:8], np.array([0, 0, 0])]
-            )
+        # 7a) 11次元 → ロボット absolute へ復元（今までどおり）
+        out_list = []
+        for t in range(stride):
+            a_rel = chunk_rel[t]  # 形状 [11]
+            a_11 = np.concatenate([
+                a_rel[0:5],
+                [a_rel[5]],
+                a_rel[6:8],
+                a_rel[8:11],
+            ])
+            a_abs = a_11 + np.concatenate([
+                obs["joint_state"][:5],
+                np.array([0]),
+                obs["joint_state"][6:8],
+                np.array([0,0,0]),
+            ])
 
             if self.use_temp_ensem:
                 alpha = 1.0 - np.exp(-np.log(2) / max(1e-6, self.temporal_half_life))
                 if self._ema_action is None:
-                    self._ema_action = action.astype(np.float64)
+                    self._ema_action = a_abs.astype(np.float64)
                 else:
-                    self._ema_action = alpha * action + (1.0 - alpha) * self._ema_action
-                action = self._ema_action
+                    self._ema_action = alpha * a_abs + (1.0 - alpha) * self._ema_action
+                a_abs = self._ema_action
+            out_list.append(a_abs)
 
-            actions.append(action)
-        return np.array(actions)
+        # 7b) 次サイクル用に「前チャンク」と「既実行カウンタ」を更新
+        self.prev_chunk_world = chunk_rel.copy()  # 次回の Y として渡す（Policy 内で Transform→32次元化）
+        self.exec_since_prev = stride            # 次回の d になる
+
+        return np.stack(out_list, axis=0)
+
 
 
 def main():

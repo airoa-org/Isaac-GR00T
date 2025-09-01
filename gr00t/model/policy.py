@@ -270,7 +270,6 @@ class Gr00tPolicy(BasePolicy):
             normalized_input["rtc_angle_indices"] = (
                 idx if isinstance(idx, torch.Tensor) else torch.as_tensor(idx, device=device, dtype=torch.long)
             )
-
         # 4) モデル実行（RTC対応パス）
         normalized_action = self._get_action_rtc_from_normalized_input(normalized_input)
         unnormalized_action = self._get_unnormalized_action(normalized_action)
