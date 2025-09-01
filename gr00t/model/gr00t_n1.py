@@ -231,6 +231,30 @@ class GR00T_N1_5(PreTrainedModel):
         pretrained_model.action_head.set_trainable_parameters(
             tune_projector=tune_projector, tune_diffusion_model=tune_diffusion_model
         )
+
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+        # まずモデル全体を移動
+        pretrained_model.to(device)
+        pretrained_model.eval()
+
+        # LayerNorm を含む正規化層を明示的に揃える（dtype も action_head 側に合わせる）
+        target_dtype = getattr(pretrained_model.action_head, "dtype", None)
+        for m in pretrained_model.modules():
+            if isinstance(m, torch.nn.LayerNorm):
+                m.to(device=device, dtype=target_dtype)
+
+        # （任意）検査：CPUに残存していないか
+        bad = []
+        for n, p in pretrained_model.named_parameters():
+            if p.device.type != device.type:
+                bad.append((n, p.device))
+        for n, b in pretrained_model.named_buffers():
+            if b.device.type != device.type:
+                bad.append((n, b.device))
+        if bad:
+            print("[WARN] tensors not on target device:", bad[:10], "...")
+
         return pretrained_model
 
 

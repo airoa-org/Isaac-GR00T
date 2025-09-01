@@ -273,6 +273,14 @@ class Gr00tPolicy(BasePolicy):
             model.action_horizon = expected_action_horizon
             model.config.action_head_cfg["action_horizon"] = expected_action_horizon
 
+        model.action_head.to(device=self.device, dtype=COMPUTE_DTYPE)
+
+        # LayerNorm 系を最後にもう一度強制で揃える（保険）
+        for m in model.modules():
+            if isinstance(m, torch.nn.LayerNorm):
+                m.to(device=self.device, dtype=COMPUTE_DTYPE)
+
+
         self.model = model
 
     def _load_metadata(self, exp_cfg_dir: Path):
