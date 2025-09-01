@@ -179,17 +179,37 @@ class GR00T_N1_5(PreTrainedModel):
         self.validate_data(action_head_outputs, backbone_outputs, is_training=False)
         return action_head_outputs
 
+    def get_action_rtc(
+        self,
+        inputs: dict,
+    ) -> BatchFeature:
+        backbone_inputs, action_inputs = self.prepare_input(inputs)
+        # Because the behavior of backbones remains the same for training and inference, we can use `forward` for backbones.
+        backbone_outputs = self.backbone(backbone_inputs)
+        action_head_outputs = self.action_head.get_action_rtc(backbone_outputs, action_inputs)
+        self.validate_data(action_head_outputs, backbone_outputs, is_training=False)
+        return action_head_outputs
+
     def prepare_input(self, inputs) -> Tuple[BatchFeature, BatchFeature]:
         self.validate_inputs(inputs)
         backbone_inputs = self.backbone.prepare_input(inputs)
         action_inputs = self.action_head.prepare_input(inputs)
 
+        # def to_device_with_maybe_dtype(x):
+        #     # Only cast to self.compute_dtype if the tensor is floating
+        #     if torch.is_floating_point(x):
+        #         return x.to(self.device, dtype=self.action_head.dtype)
+        #     else:
+        #         # Keep original dtype
+        #         return x.to(self.device)
+
         def to_device_with_maybe_dtype(x):
-            # Only cast to self.compute_dtype if the tensor is floating
+            # Tensor 以外（float, int, list, None, numpy 等）はそのまま返す
+            if not isinstance(x, torch.Tensor):
+                return x
             if torch.is_floating_point(x):
                 return x.to(self.device, dtype=self.action_head.dtype)
             else:
-                # Keep original dtype
                 return x.to(self.device)
 
         backbone_inputs = tree.map_structure(to_device_with_maybe_dtype, backbone_inputs)

@@ -405,7 +405,126 @@ class FlowmatchingActionHead(nn.Module):
 
             # Update actions using euler integration.
             actions = actions + dt * pred_velocity
+
         return BatchFeature(data={"action_pred": actions})
+
+    def get_action_rtc(self, backbone_output: BatchFeature, action_input: BatchFeature) -> BatchFeature:
+
+        backbone_output = self.process_backbone_output(backbone_output)
+
+        # Get vision and language embeddings.
+        vl_embs = backbone_output.backbone_features
+        embodiment_id = action_input.embodiment_id
+
+        # Embed state.
+        state_features = self.state_encoder(action_input.state, embodiment_id)
+
+        # Set initial actions as the sampled noise.
+        batch_size = vl_embs.shape[0]
+        device = vl_embs.device
+        actions = torch.randn(
+            size=(batch_size, self.config.action_horizon, self.config.action_dim),
+            dtype=vl_embs.dtype,
+            device=device,
+        )
+
+        num_steps = self.num_inference_timesteps
+        dt = 1.0 / num_steps
+
+        # Run denoising steps.
+        for t in range(num_steps):
+            t_cont = t / float(num_steps)                    # τ in [0,1)
+            t_discretized = int(t_cont * self.num_timestep_buckets)
+            dt = 1.0 / num_steps
+
+            # --- Optional: RTC ΠGDM guidance inputs ---
+            try:
+                Y = action_input["rtc_prev_action"]          # [B,H,D] (normalized space)
+                W = action_input["rtc_weight_mask"]          # [B,H,D] or [B,H,1]
+                beta = action_input.get("rtc_beta", 0.0)
+                guidance_clip = action_input.get("rtc_guidance_clip", 1.0)
+                angle_idx = action_input.get("rtc_angle_indices", None)
+                use_guidance = True
+            except KeyError:
+                Y = None; W = None; beta = 0.0; guidance_clip = 1.0; angle_idx = None
+                use_guidance = False
+
+            # すべてのテンソルを同じ device/dtype に揃える
+            if use_guidance:
+                if W.dim() == 3 and W.shape[-1] == 1:
+                    W = W.expand(-1, -1, self.action_dim)    # [B,H,1] -> [B,H,D]
+                Y = Y.to(device=vl_embs.device, dtype=vl_embs.dtype)
+                W = W.to(device=vl_embs.device, dtype=vl_embs.dtype)
+                if not torch.is_tensor(beta): beta = torch.tensor(float(beta), device=vl_embs.device, dtype=vl_embs.dtype)
+                if not torch.is_tensor(guidance_clip): guidance_clip = torch.tensor(float(guidance_clip), device=vl_embs.device, dtype=vl_embs.dtype)
+
+            # ---- enable grad only for this iteration (ΠGDM needs VJP wrt actions) ----
+            with torch.enable_grad():
+                A = actions.detach().requires_grad_(True)     # track grad only wrt A
+
+                # 1) エンコード（actions=A を使う）
+                timesteps_tensor = torch.full(size=(batch_size,), fill_value=t_discretized, device=device)
+                action_features = self.action_encoder(A, timesteps_tensor, embodiment_id)
+                if self.config.add_pos_embed:
+                    pos_ids = torch.arange(action_features.shape[1], dtype=torch.long, device=device)
+                    pos_embs = self.position_embedding(pos_ids).unsqueeze(0)
+                    action_features = action_features + pos_embs
+
+                # 2) ビジョン＋状態と結合
+                future_tokens = self.future_tokens.weight.unsqueeze(0).expand(vl_embs.shape[0], -1, -1)
+                sa_embs = torch.cat((state_features, future_tokens, action_features), dim=1)
+
+                # 3) モデル前向き → 速度予測 v
+                model_output = self.model(
+                    hidden_states=sa_embs,
+                    encoder_hidden_states=vl_embs,
+                    timestep=timesteps_tensor,
+                )
+                pred = self.action_decoder(model_output, embodiment_id)
+                v = pred[:, -self.action_horizon :]           # [B,H,D] = pred_velocity
+
+                if use_guidance and beta.item() > 0.0:
+                    # 4) 1歩先のデノイズ写像 Â1 = A + (1-τ)*v
+                    A_hat1 = A + (1.0 - t_cont) * v
+
+                    # 5) 誤差 e = (Y - Â1) ⊙ W  （角度DoFはwrap-to-π）
+                    e = (Y - A_hat1)
+                    if angle_idx is not None and len(angle_idx) > 0:
+                        # wrap-to-pi for specified dims
+                        # e[..., i] = atan2(sin(e[..., i]), cos(e[..., i]))
+                        idx = torch.as_tensor(angle_idx, device=e.device, dtype=torch.long)
+                        e_ang = torch.atan2(torch.sin(e.index_select(-1, idx)),
+                                            torch.cos(e.index_select(-1, idx)))
+                        e = e.scatter(-1, idx.unsqueeze(0).unsqueeze(0).expand(e.shape[0], e.shape[1], -1), e_ang)
+                    e = e * W
+
+                    # 6) VJP: g = J^T e  where J = ∂Â1/∂A
+                    g = torch.autograd.grad(
+                        outputs=A_hat1, inputs=A, grad_outputs=e,
+                        retain_graph=False, create_graph=False, allow_unused=False
+                    )[0]                                        # [B,H,D]
+
+                    # 7) 係数 α(τ) = min(β, (1-τ)/(τ * r_τ^2)) （数値安定のためεつき）
+                    tau = torch.tensor(max(t_cont, 1e-4), device=device, dtype=vl_embs.dtype)
+                    r2 = ((1.0 - tau) ** 2) / (tau ** 2 + (1.0 - tau) ** 2)
+                    alpha = torch.minimum(beta, (1.0 - tau) / (tau * r2))
+
+                    # 8) 速度に加算して更新
+                    v_guided = v + alpha * g
+                    A_next = A + dt * v_guided
+                else:
+                    # ガイダンス無し
+                    A_next = A + dt * v
+
+            # 9) 先頭 d ステップのハード凍結（W≈1のところをYで上書き）
+            if use_guidance:
+                freeze_mask = (W >= 0.999)
+                A_next = torch.where(freeze_mask, Y, A_next)
+
+            actions = A_next.detach()  # 次反復へ
+
+        return BatchFeature(data={"action_pred": actions})
+
 
     @property
     def device(self):

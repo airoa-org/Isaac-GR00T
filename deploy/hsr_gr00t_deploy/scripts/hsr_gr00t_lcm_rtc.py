@@ -3,6 +3,7 @@ from collections import deque
 
 #!/usr/bin/env python3
 from typing import Any
+import copy
 
 import cv2
 import numpy as np
@@ -152,9 +153,16 @@ class Gr00tHSRPolicy:
         self.use_temp_ensem = True          # 無効にしたい時は False
         self.temporal_half_life = 8        # フレーム半減期(=約10ステップで重み半減)
         self._ema_action = None
+
+        self.prev_chunk_world = None   # 直近の出力（非正規化＝物理空間）を保存
+        self.s_min_ratio = 0.5         # s_min = H * 0.5 くらいから
+        self.mask_lambda = 0.3         # 中間の指数減衰
+        self.rtc_beta = 5.0
+        self.rtc_guidance_clip = 1.0
     
     def reset_buffer(self):
         self.action_queue.clear()
+        
 
     def act(self, obs: dict[str, Any]) -> np.ndarray:
         """
@@ -233,7 +241,36 @@ class Gr00tHSRPolicy:
             "state.head": state_head,
             "annotation.human.task_description": instruction,  # タスクの説明
         }
-        action_chunk = self.policy.get_action(policy_input)
+
+        H = self.policy.model.action_head.action_horizon
+        D = self.policy.model.action_head.action_dim
+        #D = 11
+        B = 1
+        device = self.policy.model.device if hasattr(self.policy.model, "device") else "cuda"
+        dtype  = self.policy.model.action_head.dtype if hasattr(self.policy.model.action_head, "dtype") else torch.float32
+
+        # 遅延推定：最初は d=0 でOK。慣れてきたら実測δ/Δtで更新してね
+        d_steps = 0
+        s_min = max(1, int(H * self.s_min_ratio))
+        s_steps = max(d_steps, s_min)
+
+        W = self.policy.build_rtc_weight_mask(H, d_steps, s_steps, lam=self.mask_lambda, B=B, D=D, device=device, dtype=dtype)
+
+        # 3) 前チャンク（非正規化＝物理空間）を渡す。最初は None
+        rtc = {
+            "rtc_prev_action": self.prev_chunk_world,  # None なら ActionHead はガイダンス無しで動く
+            "rtc_weight_mask": W,
+            "rtc_beta": self.rtc_beta,
+            "rtc_guidance_clip": self.rtc_guidance_clip,
+            # "rtc_angle_indices": [10],  # 角度DoFがあれば指定
+        }
+
+        action_chunk = self.policy.get_action_rtc(policy_input, rtc)
+
+        action_chunk_world = action_chunk["action.relative"]
+
+        # 5) 次回のために「非正規化の前チャンク」を保存
+        self.prev_chunk_world = action_chunk_world.copy()
         
         self.action_queue["action.relative"].extend(action_chunk["action.relative"][self.num_traj:self.adopted_action_chunks])
     
@@ -295,10 +332,9 @@ def main():
             "instruction": "Test prompt. Do not move.",
         }
         action = policy.act(policy_input)
-        #print(action)
+        print(action)
 
     import sys; sys.exit()
-
     lcm_hsr_server = HSRLcmServer(policy)
 
     print("start server...")
