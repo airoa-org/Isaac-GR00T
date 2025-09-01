@@ -1,9 +1,10 @@
 #!/home/openpi/.venv/bin/python3
 from collections import deque
-
+import threading, queue, time
 #!/usr/bin/env python3
 from typing import Any
 import copy
+import torch
 
 import cv2
 import numpy as np
@@ -154,99 +155,175 @@ class Gr00tHSRPolicy:
         self.temporal_half_life = 8        # フレーム半減期(=約10ステップで重み半減)
         self._ema_action = None
 
-        self.prev_chunk_world = None     # 前チャンク（非正規化/ロボット座標系）
-        self.exec_since_prev = 0        # 前チャンクのうち既に実行したステップ数 d
-        self.s_min_ratio = 0.5           # 末尾自由区間の下限比
+        # ダブルバッファ & 進行状況
+        self.active_chunk_world = None     # [H, 11] 非正規化
+        self.next_chunk_world   = None     # [H, 11] 非正規化
+        self.active_offset      = 0        # active 何ステップ消費したか
+        self.stride             = num_traj # = 再計画ストライド
+        self.exec_since_prev    = 0        # RTC 用 d（= 通常 stride）
+
+        # 先読みワーカー
+        self._prefetch_req = queue.Queue(maxsize=1)
+        self._prefetch_res = queue.Queue(maxsize=1)
+        self._stop = threading.Event()
+        self._worker = threading.Thread(target=self._prefetch_loop, daemon=True)
+        self._worker.start()
+
+        # RTCハイパラ
+        self.s_min_ratio = 0.5
         self.mask_lambda = 0.3
         self.rtc_beta = 5.0
         self.rtc_guidance_clip = 1.0
+
+    def _build_prev_shifted(self, P, stride, H):
+        """P: [H,11] -> prev_shifted: [H,11], prev_mask: [H,11]"""
+        prev_shifted = np.zeros_like(P)
+        valid = max(0, H - stride)
+        prev_shifted[:valid] = P[stride:]
+        prev_mask = np.zeros_like(P, dtype=bool)
+        prev_mask[:valid] = True
+        return prev_shifted, prev_mask
+
+    def _make_weight_mask(self, H, d, s, D32, device, dtype):
+        # 既存のビルダを使用（[1,H,1] or [1,H,32] を返す想定）
+        return self.policy.build_rtc_weight_mask(
+            H=H, d=d, s=s, lam=self.mask_lambda,
+            B=1, D=D32, device=device, dtype=dtype
+        )
+
+    def _prefetch_loop(self):
+        # モデル呼び出しはこのスレッドに集約（競合回避）
+        torch.set_grad_enabled(True)  # RTC(VJP)で勾配を使う
+        while not self._stop.is_set():
+            try:
+                item = self._prefetch_req.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            if item is None:  # poison pill
+                break
+
+            obs, P_world, stride, s_min_ratio = item
+            try:
+                # ---- 入力整形 ----
+                video_head = np.expand_dims(obs["head_rgb"], axis=0)
+                video_hand = np.expand_dims(obs["hand_rgb"], axis=0)
+                state_arm  = np.expand_dims(obs["joint_state"][:5], axis=0)
+                state_hand = np.expand_dims(np.expand_dims(obs["joint_state"][5], axis=0), axis=0)
+                state_head = np.expand_dims(obs["joint_state"][6:8], axis=0)
+                instruction = [obs["instruction"]]
+                policy_input = {
+                    "video.head": video_head,
+                    "video.hand": video_hand,
+                    "state.arm" : state_arm,
+                    "state.gripper": state_hand,
+                    "state.head": state_head,
+                    "annotation.human.task_description": instruction,
+                }
+
+                H  = self.policy.model.action_head.action_horizon
+                D32 = self.policy.model.action_head.action_dim
+                device = self.policy.model.device if hasattr(self.policy.model, "device") else "cuda"
+                dtype  = (self.policy.model.action_head.dtype
+                          if hasattr(self.policy.model.action_head, "dtype") else torch.float32)
+
+                # ---- RTC: d と s ----
+                d_steps = stride
+                s_min = max(1, int(H * s_min_ratio))
+                s_steps = max(d_steps, s_min)
+
+                # ---- 前チャンクのずらし（切替点に合わせる）----
+                if P_world is not None:
+                    prev_shifted, prev_mask = self._build_prev_shifted(P_world, stride, H)  # [H,11]
+                else:
+                    prev_shifted, prev_mask = None, None
+
+                # ---- 重みマスク ----
+                W = self._make_weight_mask(H, d_steps, s_steps, D32, device, dtype)
+
+                rtc = {
+                    "rtc_prev_action": prev_shifted,   # 11次元/非正規化（Policy側でTransform→32）
+                    "rtc_prev_mask"  : prev_mask,      # 任意: 無効部を無視したいとき
+                    "rtc_weight_mask": W,              # [1,H,32] or [1,H,1]
+                    "rtc_beta": self.rtc_beta,
+                    "rtc_guidance_clip": self.rtc_guidance_clip,
+                }
+
+                # ---- 推論（RTC つき）----
+                # ※ get_action_rtc 内で Transform 正規化・32次元化・VJPガイダンス
+                out = self.policy.get_action_rtc(policy_input, rtc)
+                next_world = out["action.relative"]  # [H,11] 非正規化
+
+                self._prefetch_res.put(next_world, timeout=0.01)
+            except Exception as e:
+                # 失敗したら None を入れてフォールバック
+                self._prefetch_res.put(None)
+            finally:
+                self._prefetch_req.task_done()
+
+
     
     def reset_buffer(self):
         self.action_queue.clear()
         
 
     def act(self, obs: dict[str, Any]) -> np.ndarray:
-        # 1) 入力の整形はそのまま
-        video_head = np.expand_dims(obs["head_rgb"], axis=0)
-        video_hand = np.expand_dims(obs["hand_rgb"], axis=0)
-        state_arm  = np.expand_dims(obs["joint_state"][:5], axis=0)
-        state_hand = np.expand_dims(np.expand_dims(obs["joint_state"][5], axis=0), axis=0)
-        state_head = np.expand_dims(obs["joint_state"][6:8], axis=0)
-        instruction = [obs["instruction"]]
-        policy_input = {
-            "video.head": video_head,
-            "video.hand": video_hand,
-            "state.arm" : state_arm,
-            "state.gripper": state_hand,
-            "state.head": state_head,
-            "annotation.human.task_description": instruction,
-        }
-
-        # 2) RTC パラメータ（H, D）
         H = self.policy.model.action_head.action_horizon
-        D = self.policy.model.action_head.action_dim   # 32（Head内部）
-        B = 1
-        device = self.policy.model.device if hasattr(self.policy.model, "device") else "cuda"
-        dtype  = (self.policy.model.action_head.dtype
-                if hasattr(self.policy.model.action_head, "dtype") else torch.float32)
 
-        # 3) 遅延 d と 末尾自由 s を決める
-        d_steps = min(self.exec_since_prev, H-1) if (self.prev_chunk_world is not None) else 0
-        s_min   = max(1, int(H * self.s_min_ratio))
-        s_steps = max(d_steps, s_min)
+        # 1) 初回は同期ブートストラップ（遅延1回だけ許容）
+        if self.active_chunk_world is None:
+            # 同期で作る（d=0）
+            self._prefetch_req.queue.clear()
+            self._prefetch_res.queue.clear()
+            self._prefetch_req.put((obs, None, 0, self.s_min_ratio))
+            next_world = self._prefetch_res.get()
+            if next_world is None:
+                raise RuntimeError("RTC bootstrap failed")
+            self.active_chunk_world = next_world
+            self.active_offset = 0
+            # 次をすぐ先読み（切替時用に d=stride で）
+            self._prefetch_req.put((obs, self.active_chunk_world, self.stride, self.s_min_ratio))
 
-        # 4) 時間マスク（先頭=1, 中間=exp減衰, 末尾=0）
-        W_time = self.policy.build_rtc_weight_mask(
-            H=H, d=d_steps, s=s_steps, lam=self.mask_lambda, B=B, D=D, device=device, dtype=dtype
-        )
+        # 2) 現在のチャンクから stride 分だけ取り出し
+        start = self.active_offset
+        end   = min(H, start + self.stride)
+        chunk_rel = self.active_chunk_world[start:end]  # [stride<=, 11]
+        self.active_offset = end
 
-        # 5) RTC 入力セット（前チャンクは None ならガイダンス無し）
-        rtc = {
-            "rtc_prev_action": self.prev_chunk_world,   # shape [H, 11]（Policy 側で Transform を通して32に）
-            "rtc_weight_mask": W_time,                  # [1,H,32] or [1,H,1]
-            "rtc_beta": self.rtc_beta,
-            "rtc_guidance_clip": self.rtc_guidance_clip,
-            # "rtc_angle_indices": [10],  # 角度DoFがあれば
-        }
-
-        # 6) 毎サイクル再推論（RTCつき）
-        action_chunk = self.policy.get_action_rtc(policy_input, rtc)
-
-        # 7) 出力＆状態更新
-        #   - action_chunk["action.relative"] は [H,11]（非正規化, 相対指令）想定
-        chunk_rel = action_chunk["action.relative"]   # numpy [H,11] を想定
-        # このサイクルで吐き出すステップ数 = stride
-        stride = self.num_traj
-
-        # 7a) 11次元 → ロボット absolute へ復元（今までどおり）
+        # 3) 出力の11次元→絶対値復元（あなたの元の処理）
         out_list = []
-        for t in range(stride):
-            a_rel = chunk_rel[t]  # 形状 [11]
-            a_11 = np.concatenate([
-                a_rel[0:5],
-                [a_rel[5]],
-                a_rel[6:8],
-                a_rel[8:11],
-            ])
-            a_abs = a_11 + np.concatenate([
-                obs["joint_state"][:5],
-                np.array([0]),
-                obs["joint_state"][6:8],
-                np.array([0,0,0]),
-            ])
-
-            if self.use_temp_ensem:
-                alpha = 1.0 - np.exp(-np.log(2) / max(1e-6, self.temporal_half_life))
-                if self._ema_action is None:
-                    self._ema_action = a_abs.astype(np.float64)
-                else:
-                    self._ema_action = alpha * a_abs + (1.0 - alpha) * self._ema_action
-                a_abs = self._ema_action
+        for a_rel in chunk_rel:
+            a_11 = np.concatenate([a_rel[0:5], [a_rel[5]], a_rel[6:8], a_rel[8:11]])
+            a_abs = a_11 + np.concatenate([obs["joint_state"][:5],
+                                           np.array([0]),
+                                           obs["joint_state"][6:8],
+                                           np.array([0,0,0])])
             out_list.append(a_abs)
 
-        # 7b) 次サイクル用に「前チャンク」と「既実行カウンタ」を更新
-        self.prev_chunk_world = chunk_rel.copy()  # 次回の Y として渡す（Policy 内で Transform→32次元化）
-        self.exec_since_prev = stride            # 次回の d になる
+        # 4) 切替境界に近づいたら、バックグラウンド結果を回収してスワップ
+        #    境界: 残り < stride になったら切替
+        remaining = H - self.active_offset
+        if remaining < self.stride:
+            try:
+                # 用意できていれば使う／なければフォールバックで同期生成
+                next_world = self._prefetch_res.get_nowait()
+                if next_world is None:
+                    raise queue.Empty
+                self.active_chunk_world = next_world
+                self.active_offset = 0
+            except queue.Empty:
+                # フォールバック：同期で作る（観測 obs、前チャンク active を prev として）
+                self._prefetch_req.put((obs, self.active_chunk_world, self.stride, self.s_min_ratio))
+                next_world = self._prefetch_res.get()
+                if next_world is None:
+                    # 最後まで耐える：古いチャンクの残りを使う（最悪ケース）
+                    pass
+                else:
+                    self.active_chunk_world = next_world
+                    self.active_offset = 0
+
+            # 新しい active に切り替えたら、すぐ次を先読み要求
+            self._prefetch_req.queue.clear()  # 直近の観測で上書き
+            self._prefetch_req.put((obs, self.active_chunk_world, self.stride, self.s_min_ratio))
 
         return np.stack(out_list, axis=0)
 
