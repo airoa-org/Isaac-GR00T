@@ -242,16 +242,35 @@ class Gr00tPolicy(BasePolicy):
 
             normalized_input["rtc_prev_action"] = A_prev_t
 
+            if rtc.get("rtc_weight_mask", None) is not None:
+                W = rtc["rtc_weight_mask"]
+                W = W if isinstance(W, torch.Tensor) else torch.as_tensor(W, device=dev, dtype=adtype)
+            else:
+                # W 未指定なら “とりあえず全 1（先頭/末尾の整形は上位側で）”
+                W = torch.ones((1, actions.shape[0], 1), device=dev, dtype=adtype)
+
+            # [H,D] の actions_mask を [1,H,D] にして掛ける
+            am = torch.as_tensor(actions_mask, device=dev, dtype=adtype).unsqueeze(0)
+            if W.shape[-1] == 1:
+                W = W.expand(-1, am.shape[1], am.shape[2])
+            W = W * am
+
+            normalized_input["rtc_weight_mask"] = W
+
+
+
         # 3) 付帯（W, beta, clip, angle idx）を Tensor 化して追加
         device = self.device
         dtype  = (self.model.action_head.dtype
                 if hasattr(self.model.action_head, "dtype") else torch.float32)
 
-        if rtc.get("rtc_weight_mask", None) is not None:
-            W = rtc["rtc_weight_mask"]
-            normalized_input["rtc_weight_mask"] = (
-                W if isinstance(W, torch.Tensor) else torch.as_tensor(W, device=device, dtype=dtype)
-            )
+        # if rtc.get("rtc_weight_mask", None) is not None:
+        #     W = rtc["rtc_weight_mask"]
+        #     normalized_input["rtc_weight_mask"] = (
+        #         W if isinstance(W, torch.Tensor) else torch.as_tensor(W, device=device, dtype=dtype)
+        #     )
+
+        
 
         if rtc.get("rtc_beta", None) is not None:
             beta = rtc["rtc_beta"]
@@ -465,26 +484,48 @@ class Gr00tPolicy(BasePolicy):
 
         return mean, std
 
-
-
+    def get_action_rel_stats_tensors(self):
+        rel = self.metadata.statistics.action["relative"]
+        mean = torch.as_tensor(rel.mean, device=self.device, dtype=torch.float32).view(1,1,-1)
+        # 下限を 1e-2 に引き上げ（まずは安全側）
+        std  = torch.as_tensor(rel.std,  device=self.device, dtype=torch.float32).clamp_min(1e-2).view(1,1,-1)
+        return mean, std
 
     def _normalize_prev_action_with_stats(self, prev):
-        """
-        prev: [H,D] or [B,H,D] in *unnormalized (world)* space
-        returns: torch.Tensor [B,H,D] in *normalized* space
-        """
         if isinstance(prev, np.ndarray):
             prev = torch.from_numpy(prev)
         if not isinstance(prev, torch.Tensor):
             prev = torch.as_tensor(prev)
-
-        if prev.ndim == 2:  # [H,D] -> [1,H,D]
-            prev = prev.unsqueeze(0)
+        if prev.ndim == 2:
+            prev = prev.unsqueeze(0)  # [H,D] -> [1,H,D]
 
         mean, std = self.get_action_rel_stats_tensors()
         prev = prev.to(device=self.device, dtype=torch.float32)
         prev_norm = (prev - mean) / std
+        # ★ サニタイズ（超重要）
+        prev_norm = torch.nan_to_num(prev_norm, nan=0.0, posinf=0.0, neginf=0.0)
+        prev_norm = prev_norm.clamp_(-8.0, 8.0)
         return prev_norm
+
+
+
+    # def _normalize_prev_action_with_stats(self, prev):
+    #     """
+    #     prev: [H,D] or [B,H,D] in *unnormalized (world)* space
+    #     returns: torch.Tensor [B,H,D] in *normalized* space
+    #     """
+    #     if isinstance(prev, np.ndarray):
+    #         prev = torch.from_numpy(prev)
+    #     if not isinstance(prev, torch.Tensor):
+    #         prev = torch.as_tensor(prev)
+
+    #     if prev.ndim == 2:  # [H,D] -> [1,H,D]
+    #         prev = prev.unsqueeze(0)
+
+    #     mean, std = self.get_action_rel_stats_tensors()
+    #     prev = prev.to(device=self.device, dtype=torch.float32)
+    #     prev_norm = (prev - mean) / std
+    #     return prev_norm
 
 
 

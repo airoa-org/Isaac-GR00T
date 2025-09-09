@@ -124,3 +124,8 @@ tmp/
 output/
 
 ckpt*
+
+debug_*/
+*.json
+*.npz
+subset*
