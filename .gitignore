@@ -124,3 +124,7 @@ tmp/
 output/
 
 ckpt*
+
+debug_*/
+subset_dataset*
+*.npz

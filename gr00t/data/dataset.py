@@ -174,6 +174,8 @@ class LeRobotSingleDataset(Dataset):
         self.curr_traj_data = None
         self.curr_traj_id = None
 
+        self._picked_indices_per_traj: dict[int, list[int]] = {}
+
         # Check if the dataset is valid
         self._check_integrity()
 
@@ -430,10 +432,13 @@ class LeRobotSingleDataset(Dataset):
     def _get_all_steps(self) -> list[tuple[int, int]]:
         """(trajectory_id, base_index) の列挙を、必要なら間引いて返す"""
         all_steps: list[tuple[int, int]] = []
+        self._picked_indices_per_traj = {}
 
         # 1) 等間引きが指定されていれば速い
         if self.sample_every_n is not None and self.sample_every_n > 1:
             for trajectory_id, traj_len in zip(self.trajectory_ids, self.trajectory_lengths):
+                picked = list(range(0, int(traj_len), int(self.sample_every_n)))
+                self._picked_indices_per_traj[int(trajectory_id)] = picked
                 for base_index in range(0, int(traj_len), self.sample_every_n):
                     all_steps.append((int(trajectory_id), int(base_index)))
             return all_steps
@@ -454,12 +459,15 @@ class LeRobotSingleDataset(Dataset):
                     if t - last_t >= period or idx == 0:
                         picked.append(idx)
                         last_t = t
+                self._picked_indices_per_traj[int(trajectory_id)] = picked
                 for base_index in picked:
                     all_steps.append((int(trajectory_id), int(base_index)))
             return all_steps
 
         # 3) 間引きなし（従来動作）
         for trajectory_id, trajectory_length in zip(self.trajectory_ids, self.trajectory_lengths):
+            picked = list(range(int(trajectory_length)))
+            self._picked_indices_per_traj[int(trajectory_id)] = picked
             for base_index in range(int(trajectory_length)):
                 all_steps.append((int(trajectory_id), int(base_index)))
 
@@ -865,6 +873,120 @@ class LeRobotSingleDataset(Dataset):
             padding_strategy="first_last" if state_or_action_cfg.absolute else "zero",
         )
 
+    def get_state_or_action_concat(
+        self,
+        trajectory_id: int,
+        modality: str,
+        key: str,
+        base_index: int,
+    ) -> np.ndarray:
+        """Get the state or action data for a trajectory by a base index.
+        If the step indices are out of range, pad with the data:
+            if the data is stored in absolute format, pad with the first or last step data;
+            otherwise, pad with zero.
+
+        Args:
+            dataset (BaseSingleDataset): The dataset to retrieve the data from.
+            trajectory_id (int): The ID of the trajectory.
+            modality (str): The modality of the data.
+            key (str): The key of the data.
+            base_index (int): The base index of the trajectory.
+
+        Returns:
+            np.ndarray: The data for the trajectory and step indices.
+        """
+        # Get the step indices
+        step_indices = np.array(self.delta_indices[key]) + base_index
+        #print(f"{key}:{step_indices=}")
+        # Get the trajectory index
+        trajectory_index = self.get_trajectory_index(trajectory_id)
+        # Get the maximum length of the trajectory
+        max_length = self.trajectory_lengths[trajectory_index]
+        assert key.startswith(modality + "."), f"{key} must start with {modality + '.'}, got {key}"
+        # Get the sub-key, e.g. state.joint_angles -> joint_angles
+        key = key.replace(modality + ".", "")
+        # Get the lerobot key
+        le_state_or_action_cfg = getattr(self.lerobot_modality_meta, modality)
+        le_key = le_state_or_action_cfg[key].original_key
+        if le_key is None:
+            le_key = key
+        # Get the data array, shape: (T, D)
+        assert self.curr_traj_data is not None, f"No data found for {trajectory_id=}"
+        assert le_key in self.curr_traj_data.columns, f"No {le_key} found in {trajectory_id=}"
+        data_array: np.ndarray = np.stack(self.curr_traj_data[le_key])  # type: ignore
+        assert data_array.ndim == 2, f"Expected 2D array, got {data_array.shape} array"
+        le_indices = np.arange(
+            le_state_or_action_cfg[key].start,
+            le_state_or_action_cfg[key].end,
+        )
+        data_array = data_array[:, le_indices]
+        # Get the state or action configuration
+        state_or_action_cfg = getattr(self.metadata.modalities, modality)[key]
+        #is_absolute = state_or_action_cfg.absolute
+        #rotation_type = state_or_action_cfg.rotation_type  # "quaternion" など
+
+        # ここから「取り出しインデックス」を作る（既存）
+        #step_indices = np.array(self.delta_indices[key]) + base_index
+        #trajectory_index = self.get_trajectory_index(trajectory_id)
+        #max_length = self.trajectory_lengths[trajectory_index]
+        # 端処理はこの後 retrieve_data_and_pad に任せる
+
+        # ---- 重要：relative action を間引いているときの合成処理 ----
+        if modality == "action" and (
+            (self.sample_every_n is not None and self.sample_every_n > 1) or
+            (self.target_fps is not None and self.target_fps > 0)
+        ):
+            # 1. まず「大きい刻み」の基準インデックス列を得る（既存の step_indices）
+            # 2. 各インデックス i について、「次の採用点まで」の全deltaを合成して1本にする
+            #    例えば sample_every_n = s のとき、i..i+(s-1) を合成
+            picked = self._picked_indices_per_traj.get(int(trajectory_id), None)
+
+            composed_list = []
+            for idx in step_indices:
+                # 合成区間の幅を決める
+                if self.sample_every_n is not None and self.sample_every_n > 1:
+                    stride = int(self.sample_every_n)
+                    start = int(np.clip(idx, 0, max_length - 1))
+                    end   = int(np.clip(idx + stride - 1, 0, max_length - 1))
+                else:
+                    # target_fps の場合：次の採用点まで
+                    # base の idx から picked 内で「次の採用点」を探す
+                    # idx 自体が picked に居ないこともあるので、>=idx の位置を探す
+                    import bisect
+                    if picked is None or len(picked) == 0:
+                        start = int(np.clip(idx, 0, max_length - 1))
+                        end   = start
+                    else:
+                        pos = bisect.bisect_left(picked, int(idx))
+                        # 現在区間の開始は idx、終了は「次の picked の直前」
+                        start = int(np.clip(idx, 0, max_length - 1))
+                        if pos + 1 < len(picked):
+                            end = int(np.clip(picked[pos + 1] - 1, 0, max_length - 1))
+                        else:
+                            end = max_length - 1
+
+                window = data_array[start:end + 1]          # (K, D)
+                composed = self._compose_sum_with_abs6(window)
+                composed_list.append(composed)
+
+            composed = np.stack(composed_list, axis=0)       # (T, D)`
+
+            # relative を区間合成済みなので padding は 0 でOK
+            return self.retrieve_data_and_pad(
+                array=composed,
+                step_indices=np.arange(len(composed)),
+                max_length=len(composed),
+                padding_strategy="zero",
+            )
+
+        # ---- それ以外（従来の1ステップ取り出し） ----
+        return self.retrieve_data_and_pad(
+            array=data_array,
+            step_indices=step_indices,
+            max_length=max_length,
+            padding_strategy="first_last" if state_or_action_cfg.absolute else "zero",
+        )
+
     def get_language(
         self,
         trajectory_id: int,
@@ -934,11 +1056,81 @@ class LeRobotSingleDataset(Dataset):
         if modality == "video":
             return self.get_video(trajectory_id, key, base_index)
         elif modality == "state" or modality == "action":
-            return self.get_state_or_action(trajectory_id, modality, key, base_index)
+            #return self.get_state_or_action(trajectory_id, modality, key, base_index)
+            return self.get_state_or_action_concat(trajectory_id, modality, key, base_index)
         elif modality == "language":
             return self.get_language(trajectory_id, key, base_index)
         else:
             raise ValueError(f"Invalid modality: {modality}")
+
+    def _compose_relative_actions(self, arr_window: np.ndarray, rotation_type: str | None):
+        """
+        arr_window: 形状 (K, D) の相対アクション列（Kは区間内のフレーム数）
+        rotation_type: "quaternion" | "axis_angle" | "euler" | None
+        戻り値: 形状 (D,) の1本に合成された相対アクション
+        """
+        vec = arr_window.copy()  # (K, D)
+
+        # 例: 配列の先頭から [pos, rot, gripper] のように並ぶ想定なら
+        # メタデータで各サブキーの範囲が取れるのが理想だけど、
+        # ここでは簡単のために rotation_type がある＝回転成分が含まれる前提で分岐。
+        if rotation_type in ("quaternion", "axis_angle", "euler"):
+            # --- 並進成分は総和 ---
+            # 例) 並進3要素が先頭にあると仮定
+            # 必要ならメタの start/end で厳密に切り出して
+            trans = vec[:, :3].sum(axis=0)
+
+            # --- 回転成分は合成 ---
+            if rotation_type == "quaternion":
+                # vec[:, 3:7] が dq（相対回転クォータニオン）と仮定
+                q = np.array([1.0, 0.0, 0.0, 0.0])  # 単位Quat(w,x,y,z)
+                for dq in vec[:, 3:7]:
+                    # 正規化（数値安定）
+                    dq = dq / (np.linalg.norm(dq) + 1e-12)
+                    # 合成 q <- q * dq
+                    w1,x1,y1,z1 = q
+                    w2,x2,y2,z2 = dq
+                    q = np.array([
+                        w1*w2 - x1*x2 - y1*y2 - z1*z2,
+                        w1*x2 + x1*w2 + y1*z2 - z1*y2,
+                        w1*y2 - x1*z2 + y1*w2 + z1*x2,
+                        w1*z2 + x1*y2 - y1*x2 + z1*w2
+                    ])
+                q = q / (np.linalg.norm(q) + 1e-12)
+                rot = q
+                tail = vec[:, 7:]  # 残り（グリッパ等）
+            elif rotation_type == "axis_angle":
+                # 近似: 小角なら単純加算でも大抵OK。厳密にはexp/logでSE(3)合成。
+                rot = vec[:, 3:6].sum(axis=0)
+                tail = vec[:, 6:]
+            elif rotation_type == "euler":
+                # オイラーは順序依存＆合成が不安定。小角想定で総和か、クォータニオン化が無難。
+                rot = vec[:, 3:6].sum(axis=0)
+                tail = vec[:, 6:]
+
+            # tail の扱い（例：グリッパは最後の値）
+            if tail.size > 0:
+                last = vec[-1, -tail.shape[1]:]
+                out = np.concatenate([trans, rot, last], axis=0)
+            else:
+                out = np.concatenate([trans, rot], axis=0)
+            return out
+        else:
+            # 回転なし：並進は総和、離散は最後、レート量は平均など
+            # ここはプロジェクト仕様に合わせて調整
+            return vec.sum(axis=0)  # とりあえず総和
+
+    def _compose_sum_with_abs6(self, window: np.ndarray) -> np.ndarray:
+        """
+        window: 形状 (K, D) の連続相対アクション列
+        戻り値: 形状 (D,) の1本に合成されたアクション
+        ルール: index!=5 は総和、index==5 は window の最後の値
+        """
+        s = window.sum(axis=0)              # 全次元をまず総和
+        if s.shape[0] >= 6:
+            s[5] = window[-1, 5]            # 6次元目だけ絶対（最後を採用）
+        return s
+
 
 
 class CachedLeRobotSingleDataset(LeRobotSingleDataset):

@@ -129,6 +129,9 @@ class ArgsConfig:
     balance_trajectory_weights: bool = True
     """Used in LeRobotMixtureDataset. If True, sample trajectories within a dataset weighted by their length; otherwise, equal weighting."""
 
+    sample_every_n: int = None
+
+    target_fps: float = None
 
 #####################################################################################
 # main training function
@@ -156,6 +159,8 @@ def main(config: ArgsConfig):
             embodiment_tag=embodiment_tag,  # This will override the dataset's embodiment tag to "new_embodiment"
             video_backend=config.video_backend,
             include_episodes=include_eps,
+            sample_every_n=config.sample_every_n,
+            target_fps=config.target_fps,
         )
     else:
         single_datasets = []

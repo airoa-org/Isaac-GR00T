@@ -10,14 +10,14 @@ modality_configs = data_config_cls.modality_config()
 
 # データセットを用意（学習と同じ引数に合わせてください）
 ds = LeRobotSingleDataset(
-    dataset_path="/home/group_25b505/dataset/hsr/processed/2025-07-v3.0-success-only",
+    dataset_path="/home/group_25b505/group_6/workspace/user_00094_25b505/Isaac-GR00T/demo_data/012725_curated",
     modality_configs=modality_configs,
     embodiment_tag=EmbodimentTag("new_embodiment"),  # 学習時の指定に合わせる
     video_backend="torchvision_av",                           # 使っているバックエンドに合わせる
 )
 
 # 抜き出したいエピソード ID（episodes.jsonl の episode_index）
-EP = 1511
+EP = 1
 
 # 1) まず、このエピソードの軌跡表（低次元の元データ）を取り出せます
 #traj_df = ds.get_trajectory_data(EP)  # pandas.DataFrame
