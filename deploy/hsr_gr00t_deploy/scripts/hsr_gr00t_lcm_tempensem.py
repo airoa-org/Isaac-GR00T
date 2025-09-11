@@ -35,7 +35,7 @@ def compressedimage_to_array_lcm(msg):
 class HSRLcmServer:
     GRIPPER_OPEN = 1
     GRIPPER_CLOSE = 0
-    GRIPPER_CLOSE_THRESHOLD = 0.9  # グリッパーを閉じる閾値
+    GRIPPER_CLOSE_THRESHOLD = 0.2  # グリッパーを閉じる閾値
 
     def __init__(self, policy, traj_hz=10.0):
         self.traj_hz = float(traj_hz)
@@ -149,8 +149,8 @@ class Gr00tHSRPolicy:
         self.actions_rel = replay_episode["actions"]
         self.frame_num = 0
 
-        self.use_temp_ensem = True          # 無効にしたい時は False
-        self.temporal_half_life = 8        # フレーム半減期(=約10ステップで重み半減)
+        self.use_temp_ensem = False          # 無効にしたい時は False
+        self.temporal_half_life = 16        # フレーム半減期(=約10ステップで重み半減)
         self._ema_action = None
     
     def reset_buffer(self):
@@ -213,7 +213,6 @@ class Gr00tHSRPolicy:
                     else:
                         self._ema_action = alpha * action + (1.0 - alpha) * self._ema_action
                     action = self._ema_action
-
                 actions.append(action)
             return np.stack(actions)
 
@@ -269,7 +268,6 @@ class Gr00tHSRPolicy:
                 else:
                     self._ema_action = alpha * action + (1.0 - alpha) * self._ema_action
                 action = self._ema_action
-
             actions.append(action)
         return np.array(actions)
 
@@ -278,7 +276,7 @@ def main():
     print("Start Issac-GR00T")
 
     # TODO: 引数でいい感じに処理するようにする
-    checkpoint_dir = "/home/veluga-g3/airoa/gr00t-chunk16-10hz"
+    checkpoint_dir = "/home/veluga-g3/airoa/gr00t-chunk16-10hz_v2"
     adopted_action_chunks = 15
 
     print(f"checkpoint_dir: {checkpoint_dir}")
@@ -286,18 +284,18 @@ def main():
 
     policy = Gr00tHSRPolicy(model_path=checkpoint_dir,adopted_action_chunks=adopted_action_chunks)
 
-    for i in range(20):
-        rand_img = np.random.randint(0, 256, (480, 640, 3), dtype=np.uint8)
-        policy_input = {
-            "head_rgb": rand_img,
-            "hand_rgb": rand_img,
-            "joint_state": np.array([0.0 for _ in range(8)]),
-            "instruction": "Test prompt. Do not move.",
-        }
-        action = policy.act(policy_input)
-        #print(action)
+    # for i in range(20):
+    #     rand_img = np.random.randint(0, 256, (480, 640, 3), dtype=np.uint8)
+    #     policy_input = {
+    #         "head_rgb": rand_img,
+    #         "hand_rgb": rand_img,
+    #         "joint_state": np.array([0.0 for _ in range(8)]),
+    #         "instruction": "Test prompt. Do not move.",
+    #     }
+    #     action = policy.act(policy_input)
+    #     #print(action)
 
-    import sys; sys.exit()
+    # import sys; sys.exit()
 
     lcm_hsr_server = HSRLcmServer(policy)
 

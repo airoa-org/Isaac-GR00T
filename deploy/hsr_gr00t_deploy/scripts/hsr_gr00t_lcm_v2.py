@@ -35,7 +35,7 @@ def compressedimage_to_array_lcm(msg):
 class HSRLcmServer:
     GRIPPER_OPEN = 1
     GRIPPER_CLOSE = 0
-    GRIPPER_CLOSE_THRESHOLD = 0.5  # グリッパーを閉じる閾値
+    GRIPPER_CLOSE_THRESHOLD = 0.9  # グリッパーを閉じる閾値
 
     def __init__(self, policy, traj_hz=10.0):
         self.traj_hz = float(traj_hz)
@@ -188,6 +188,7 @@ class Gr00tHSRPolicy:
                     [
                         action_relative[0:5],
                         [action_relative[5]],
+                        #[0.0],
                         #action_relative[7:9],
                         #action_relative[9:12],
                         action_relative[6:8],
@@ -230,6 +231,7 @@ class Gr00tHSRPolicy:
                 [
                     action_relative[0:5],
                     [action_relative[5]],
+                    #[0.0],
                     #action_relative[7:9],
                     #action_relative[9:12],
                     action_relative[6:8],
@@ -253,8 +255,8 @@ def main():
     print("Start Issac-GR00T")
 
     # TODO: 引数でいい感じに処理するようにする
-    checkpoint_dir = "/home/veluga-g3/airoa/gr00t-chunk48"
-    adopted_action_chunks = 47
+    checkpoint_dir = "/home/veluga-g3/airoa/gr00t-07-all"
+    adopted_action_chunks = 15
 
     print(f"checkpoint_dir: {checkpoint_dir}")
     print(f"adopted_action_chunks: {adopted_action_chunks}")

@@ -323,18 +323,6 @@ def main():
 
     policy = Gr00tHSRPolicy(model_path=checkpoint_dir,adopted_action_chunks=adopted_action_chunks)
 
-    for i in range(100):
-        rand_img = np.random.randint(0, 256, (480, 640, 3), dtype=np.uint8)
-        policy_input = {
-            "head_rgb": rand_img,
-            "hand_rgb": rand_img,
-            "joint_state": np.array([0.0 for _ in range(8)]),
-            "instruction": "Test prompt. Do not move.",
-        }
-        action = policy.act(policy_input)
-        print(action)
-
-    import sys; sys.exit()
     lcm_hsr_server = HSRLcmServer(policy)
 
     print("start server...")
