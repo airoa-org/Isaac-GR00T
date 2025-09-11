@@ -152,9 +152,16 @@ class Gr00tHSRPolicy:
         self.use_temp_ensem = True          # 無効にしたい時は False
         self.temporal_half_life = 8        # フレーム半減期(=約10ステップで重み半減)
         self._ema_action = None
+
+        self.max_timesteps = 10000000
+        self.num_queries = 16
+        self.action_dim = 11
+        self.all_time_actions = torch.zeros([self.max_timesteps, self.max_timesteps+self.num_queries, self.action_dim]).cuda()
+        self.t = 0
     
     def reset_buffer(self):
         self.action_queue.clear()
+        self.t = 0
 
     def act(self, obs: dict[str, Any]) -> np.ndarray:
         """
@@ -182,40 +189,6 @@ class Gr00tHSRPolicy:
                 "base_t",
             ]
         """
-        #print(self.action_queue)
-        if len(self.action_queue["action.relative"]) >= self.num_traj:
-            actions = []
-            for _ in range(self.num_traj):
-                action_relative = self.action_queue["action.relative"].popleft()
-                #action_relative = self.actions_rel[self.frame_num]
-                action = np.concatenate(
-                    [
-                        action_relative[0:5],
-                        [action_relative[5]],
-                        #action_relative[7:9],
-                        #action_relative[9:12],
-                        action_relative[6:8],
-                        #[0,0],
-                        action_relative[8:11],
-                    ]
-                )
-                self.frame_num += 1
-
-                action = action + np.concatenate(
-                    [obs["joint_state"][:5], np.array([0]), obs["joint_state"][6:8], np.array([0, 0, 0])]
-                )
-
-                if self.use_temp_ensem:
-                    # half-life から EMA 係数 α を算出
-                    alpha = 1.0 - np.exp(-np.log(2) / max(1e-6, self.temporal_half_life))
-                    if self._ema_action is None:
-                        self._ema_action = action.astype(np.float64)
-                    else:
-                        self._ema_action = alpha * action + (1.0 - alpha) * self._ema_action
-                    action = self._ema_action
-
-                actions.append(action)
-            return np.stack(actions)
 
         print("=== Gr00tHSRPolicy: Getting action from policy ===")
         # image shapeは(480, 640, 3) → (1, 480, 640, 3)
@@ -235,43 +208,37 @@ class Gr00tHSRPolicy:
         }
         action_chunk = self.policy.get_action(policy_input)
         
-        self.action_queue["action.relative"].extend(action_chunk["action.relative"][self.num_traj:self.adopted_action_chunks])
-    
         actions = []
-        for i in range(self.num_traj):
-            action_relative = self.action_queue["action.relative"].popleft()
-            #action_relative = self.actions_rel[self.frame_num]
+        for i in range(len(action_chunk["action.relative"]))
+            action_relative = action_chunk["action.relative"][i]
             action = np.concatenate(
                 [
                     action_relative[0:5],
                     [action_relative[5]],
-                    #action_relative[7:9],
-                    #action_relative[9:12],
                     action_relative[6:8],
-                    #[0,0],
                     action_relative[8:11],
                 ]
             )
 
-            self.frame_num += 1
-
-
-        
             # 差分になっている行動を元に戻す
             action = action + np.concatenate(
                 [obs["joint_state"][:5], np.array([0]), obs["joint_state"][6:8], np.array([0, 0, 0])]
             )
 
-            if self.use_temp_ensem:
-                alpha = 1.0 - np.exp(-np.log(2) / max(1e-6, self.temporal_half_life))
-                if self._ema_action is None:
-                    self._ema_action = action.astype(np.float64)
-                else:
-                    self._ema_action = alpha * action + (1.0 - alpha) * self._ema_action
-                action = self._ema_action
-
             actions.append(action)
-        return np.array(actions)
+
+        self.all_time_actions[[self.t], self.t:self.t+self.num_queries] = actions
+        actions_for_curr_step = all_time_actions[:, self.t]
+        actions_populated = torch.all(actions_for_curr_step != 0, axis=1)
+        actions_for_curr_step = actions_for_curr_step[actions_populated]
+        k = 0.01
+        exp_weights = np.exp(-k * np.arange(len(actions_for_curr_step)))
+        exp_weights = exp_weights / exp_weights.sum()
+        exp_weights = torch.from_numpy(exp_weights).cuda().unsqueeze(dim=1)
+        raw_action = (actions_for_curr_step * exp_weights).sum(dim=0, keepdim=True)
+        self.t += 1
+
+        return raw_action
 
 
 def main():
