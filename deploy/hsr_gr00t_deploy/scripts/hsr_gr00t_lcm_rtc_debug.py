@@ -380,20 +380,20 @@ class Gr00tHSRPolicy:
         # ダブルバッファ & 進行状況
         self.active_chunk_world = None     # [H, 11] 非正規化
         self.next_chunk_world   = None     # [H, 11] 非正規化
-        # self.active_offset      = 0        # active 何ステップ消費したか
+        self.active_offset      = 0        # active 何ステップ消費したか
         self.stride             = num_traj # = 再計画ストライド
-        # self.exec_since_prev    = 0        # RTC 用 d（= 通常 stride）
+        self.exec_since_prev    = 0        # RTC 用 d（= 通常 stride）
 
         # 先読みワーカー
-        # self._prefetch_req = queue.Queue(maxsize=1)
-        # self._prefetch_res = queue.Queue(maxsize=1)
-        # self._stop = threading.Event()
-        # self._worker = threading.Thread(target=self._prefetch_loop, daemon=True)
-        # self._worker.start()
+        self._prefetch_req = queue.Queue(maxsize=1)
+        self._prefetch_res = queue.Queue(maxsize=1)
+        self._stop = threading.Event()
+        self._worker = threading.Thread(target=self._prefetch_loop, daemon=True)
+        self._worker.start()
 
         # RTCハイパラ
-        # self.s_min_ratio = 0.5
-        # self.mask_lambda = 0.3
+        self.s_min_ratio = 0.5
+        self.mask_lambda = 0.3
         
 
         self.H = self.policy.model.action_head.action_horizon
@@ -404,6 +404,7 @@ class Gr00tHSRPolicy:
         lam = 0.0
         self.rtc_beta = 0.05
         self.rtc_guidance_clip = 0.5
+        self.stride = 1
 
         self.W = self.build_rtc_weight_mask(self.H, d_steps, s_steps, lam=lam,
                                           B=1, D=self.D_model,  # 内部で最終的に 32 にパディングされるが、policy側で合わせる実装にしていればOK
@@ -647,28 +648,7 @@ class Gr00tHSRPolicy:
         #prev_chunk_world = (gt_chunk.copy() if use_gt_prev else pred_chunk.copy())
         self.prev_chunk_world = A_prev.copy()
 
-        actions = []
-
-        self.action_queue["action.relative"].extend(pred_chunk[self.num_traj:self.adopted_action_chunks])
-
-        for i in range(self.num_traj)
-            action_relative = pred_chunk[i]
-            action = np.concatenate(
-                [
-                    action_relative[0:5],
-                    [action_relative[5]],
-                    action_relative[6:8],
-                    action_relative[8:11],
-                ]
-            )
-
-            # 差分になっている行動を元に戻す
-            action = action + np.concatenate(
-                [obs["joint_state"][:5], np.array([0]), obs["joint_state"][6:8], np.array([0, 0, 0])]
-            )
-            actions.append(action)
-
-        return actions
+        return pred_chunk
 
 def angle_wrap_inplace(actions: np.ndarray, angle_indices: Optional[list[int]]):
     """
@@ -692,8 +672,62 @@ def main():
     print(f"checkpoint_dir: {checkpoint_dir}")
     print(f"adopted_action_chunks: {adopted_action_chunks}")
 
+    num_steps = 300
+    stride = 1
+    episode = "/home/group_25b505/group_6/workspace/user_00031_25b505/Isaac-GR00T/subset_dataset"
     policy = Gr00tHSRPolicy(model_path=checkpoint_dir,adopted_action_chunks=adopted_action_chunks)
 
+    ep = load_episode_lerobot(
+    episode, split="train", episode_index=0,
+    head_key_hint="video.head",     # 例: 実キー名に合わせる
+    hand_key_hint="video.hand",
+    state_key_hint="state.arm",
+    action_key_hint="action.relative",
+    instr_key_hint="annotation.human.task_description"
+    )
+    angle_idx = []
+
+    T = ep.head_rgb.shape[0]
+
+    steps = min(num_steps, T - policy.H - 1)
+
+
+    s = stride
+
+    per_step_errs = []    # [step] → 1 float (実際は今ステップで消費する d=0 の位置の誤差)
+    mean_chunk_errs = []
+
+
+    t = 0
+    for step in range(0, steps, s):
+
+        gt_chunk = ep.action_relative[t : t + policy.H].copy()  # (H, 11)
+        angle_wrap_inplace(gt_chunk, angle_idx)
+
+        obs = {
+                "head_rgb": ep.head_rgb[t],
+                "hand_rgb": ep.hand_rgb[t],
+                "joint_state": ep.joint_state[t],
+                "instruction": ep.instruction,
+        }
+        action = policy.act(obs)
+        angle_wrap_inplace(action, angle_idx)
+        l2_all = l2_per_step(action, gt_chunk)  # [H]
+        #per_step_errs.append(float(l2_all[0]))      # 今フレームで実際に使う最初の1ステップ
+        per_step_errs.append(float(l2_all[:s].mean()))
+        mean_chunk_errs.append(float(l2_all.mean()))
+
+
+        # 時刻を進める（ここでは stride=1。実機では num_traj 分だけポップするのが理想）
+        t += s
+        if t + policy.H >= T:
+            break
+    errs1 = np.array(per_step_errs)
+    chunk_errs1 = np.array(mean_chunk_errs)
+    print(f"[RTC]    per-step L2: mean={errs1.mean():.4f}  median={np.median(errs1):.4f}  n={len(errs1)}")
+    print(f"[RTC]    per-chunk L2: mean={chunk_errs1.mean():.4f} n={len(chunk_errs1)}")
+
+    import sys; sys.exit()
     lcm_hsr_server = HSRLcmServer(policy)
 
     print("start server...")
