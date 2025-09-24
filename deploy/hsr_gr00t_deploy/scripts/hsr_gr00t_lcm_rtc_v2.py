@@ -333,7 +333,7 @@ def main():
     print("Start Issac-GR00T")
 
     # TODO: 引数でいい感じに処理するようにする
-    checkpoint_dir = "/home/veluga-g3/airoa/gr00t-chunk16-10hz"
+    checkpoint_dir = "/home/veluga-g3/airoa/gr00t-chunk16-5hz"
     adopted_action_chunks = 15
 
     print(f"checkpoint_dir: {checkpoint_dir}")
