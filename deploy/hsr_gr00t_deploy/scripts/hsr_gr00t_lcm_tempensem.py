@@ -117,7 +117,8 @@ class Gr00tHSRPolicy:
         self,
         model_path: str = "/home/veluga-g3/airoa/gr00t-microwave", 
         adopted_action_chunks: int = 15,
-        num_traj: int = 1
+        num_traj: int = 1,
+        use_temp_ensem: bool = True,
     ):
         assert num_traj <= adopted_action_chunks, "num_traj must be <= adopted_action_chunks"
         self.dagtconfig = data_config = DATA_CONFIG_MAP["hsr_v2"]
@@ -145,12 +146,12 @@ class Gr00tHSRPolicy:
         }
         #self.reset_buffer()
 
-        replay_episode = np.load("/home/veluga-g3/Downloads/episode_1511_action_relative.npz", allow_pickle=False)
-        self.actions_rel = replay_episode["actions"]
+        # replay_episode = np.load("/home/veluga-g3/Downloads/episode_1511_action_relative.npz", allow_pickle=False)
+        # self.actions_rel = replay_episode["actions"]
         self.frame_num = 0
 
-        self.use_temp_ensem = True          # 無効にしたい時は False
-        self.temporal_half_life = 8        # フレーム半減期(=約10ステップで重み半減)
+        self.use_temp_ensem = use_temp_ensem          # 無効にしたい時は False
+        self.temporal_half_life = 16        # フレーム半減期(=約10ステップで重み半減)
         self._ema_action = None
     
     def reset_buffer(self):
@@ -194,7 +195,8 @@ class Gr00tHSRPolicy:
                         [action_relative[5]],
                         #action_relative[7:9],
                         #action_relative[9:12],
-                        action_relative[6:8],
+                        #action_relative[6:8],
+                        [0.0,0.0],
                         #[0,0],
                         action_relative[8:11],
                     ]
@@ -219,6 +221,8 @@ class Gr00tHSRPolicy:
 
         print("=== Gr00tHSRPolicy: Getting action from policy ===")
         # image shapeは(480, 640, 3) → (1, 480, 640, 3)
+        #np.save("hand_rgb.npy", obs["hand_rgb"])
+        #np.save("head_rgb.npy", obs["head_rgb"])
         video_head = np.expand_dims(obs["head_rgb"], axis=0)
         video_hand = np.expand_dims(obs["hand_rgb"], axis=0)
         state_arm = np.expand_dims(obs["joint_state"][:5], axis=0)  # armの状態
@@ -233,10 +237,12 @@ class Gr00tHSRPolicy:
             "state.head": state_head,
             "annotation.human.task_description": instruction,  # タスクの説明
         }
+        #print(policy_input)
         action_chunk = self.policy.get_action(policy_input)
-        
+        #print(action_chunk)
         self.action_queue["action.relative"].extend(action_chunk["action.relative"][self.num_traj:self.adopted_action_chunks])
-    
+
+
         actions = []
         for i in range(self.num_traj):
             action_relative = self.action_queue["action.relative"].popleft()
@@ -247,7 +253,8 @@ class Gr00tHSRPolicy:
                     [action_relative[5]],
                     #action_relative[7:9],
                     #action_relative[9:12],
-                    action_relative[6:8],
+                    #action_relative[6:8],
+                    [0.0,0.0],
                     #[0,0],
                     action_relative[8:11],
                 ]
@@ -270,6 +277,13 @@ class Gr00tHSRPolicy:
                     self._ema_action = alpha * action + (1.0 - alpha) * self._ema_action
                 action = self._ema_action
 
+
+            if np.isnan(action).any():
+                print("Warning: NaN detected in action, resetting to zero.")
+                action = np.concatenate(
+                [obs["joint_state"][:5], np.array([0]), obs["joint_state"][6:8], np.array([0, 0, 0])]
+                )
+
             actions.append(action)
         return np.array(actions)
 
@@ -278,26 +292,29 @@ def main():
     print("Start Issac-GR00T")
 
     # TODO: 引数でいい感じに処理するようにする
-    checkpoint_dir = "/home/veluga-g3/airoa/gr00t-chunk16-10hz"
+    #checkpoint_dir = "/home/hsr_pc5/group6/Isaac-GR00T/ckpt/2025-05-06-v3.0-success-only/refinetune-2025-05-06-07-steps-100000-lr-1e-5_bsz-16_workers-16_gpu-4_lr-1e-5_compile-None/checkpoint-99000"
+    #checkpoint_dir = "/home/hsr_pc5/group6/Isaac-GR00T/ckpt/2025-05-06-v3.0-success-only/refinetune-2025-05-06-07-steps-100000-lr-1e-5_bsz-16_workers-16_gpu-4_lr-1e-5_compile-None_hz-5/checkpoint-99000"
+    #checkpoint_dir = "/home/hsr_pc5/group6/Isaac-GR00T/ckpt/2025-05-06-v3.0-success-only/refinetune-2025-05-06-07-steps-100000-lr-5e-5_bsz-16_workers-16_gpu-4_lr-5e-5_compile-None/checkpoint-99000"
+    #checkpoint_dir = "/home/hsr_pc5/group6/Isaac-GR00T/ckpt/2025-05-06-v3.0-success-only/refinetune-2025-05-06-07-steps-100000-lr-5e-5_bsz-16_workers-16_gpu-4_lr-5e-5_compile-None_hz-5/checkpoint-99000"
+    #checkpoint_dir = "/home/hsr_pc5/group6/Isaac-GR00T/ckpt/gr00t-tmc"
+    checkpoint_dir = "/home/hsr_pc5/group6/Isaac-GR00T/ckpt/2025-05-06-07-v3.0/steps-2000000_bsz-8_workers-8_gpu-8_lr-5e-5_compile-None/checkpoint-2000000"
     adopted_action_chunks = 15
 
     print(f"checkpoint_dir: {checkpoint_dir}")
     print(f"adopted_action_chunks: {adopted_action_chunks}")
 
-    policy = Gr00tHSRPolicy(model_path=checkpoint_dir,adopted_action_chunks=adopted_action_chunks)
+    policy = Gr00tHSRPolicy(model_path=checkpoint_dir,adopted_action_chunks=adopted_action_chunks,use_temp_ensem=True)
 
-    for i in range(20):
-        rand_img = np.random.randint(0, 256, (480, 640, 3), dtype=np.uint8)
-        policy_input = {
-            "head_rgb": rand_img,
-            "hand_rgb": rand_img,
-            "joint_state": np.array([0.0 for _ in range(8)]),
-            "instruction": "Test prompt. Do not move.",
-        }
-        action = policy.act(policy_input)
-        #print(action)
-
-    import sys; sys.exit()
+    # rand_img = np.random.randint(0, 256, (480, 640, 3), dtype=np.uint8)
+    # policy_input = {
+    #     "head_rgb": rand_img,
+    #     "hand_rgb": rand_img,
+    #     "joint_state": np.array([0.0 for _ in range(8)]),
+    #     "instruction": "Test prompt. Do not move.",
+    # }
+    # action = policy.act(policy_input)
+    #print(action)
+    #import sys; sys.exit()
 
     lcm_hsr_server = HSRLcmServer(policy)
 

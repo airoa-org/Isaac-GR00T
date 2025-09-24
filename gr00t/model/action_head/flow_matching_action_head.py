@@ -373,16 +373,21 @@ class FlowmatchingActionHead(nn.Module):
         num_steps = self.num_inference_timesteps
         dt = 1.0 / num_steps
 
+        
+
         # Run denoising steps.
         for t in range(num_steps):
             t_cont = t / float(num_steps)  # e.g. goes 0, 1/N, 2/N, ...
             t_discretized = int(t_cont * self.num_timestep_buckets)
+            print("step", t, "t_cont", t_cont)
 
             # Embed noised action trajectory.
             timesteps_tensor = torch.full(
                 size=(batch_size,), fill_value=t_discretized, device=device
             )
             action_features = self.action_encoder(actions, timesteps_tensor, embodiment_id)
+            #if torch.isnan(action_features).any():
+            #    print("Warning: NaN detected in action_features, resetting to zero.")
             # Maybe add position embedding.
             if self.config.add_pos_embed:
                 pos_ids = torch.arange(action_features.shape[1], dtype=torch.long, device=device)
@@ -393,6 +398,7 @@ class FlowmatchingActionHead(nn.Module):
             future_tokens = self.future_tokens.weight.unsqueeze(0).expand(vl_embs.shape[0], -1, -1)
             sa_embs = torch.cat((state_features, future_tokens, action_features), dim=1)
 
+
             # Run model forward.
             model_output = self.model(
                 hidden_states=sa_embs,
@@ -402,9 +408,13 @@ class FlowmatchingActionHead(nn.Module):
             pred = self.action_decoder(model_output, embodiment_id)
 
             pred_velocity = pred[:, -self.action_horizon :]
-
+            
+            #print(actions)
+            #print(dt)
+            #print(pred_velocity)
             # Update actions using euler integration.
             actions = actions + dt * pred_velocity
+            
 
         return BatchFeature(data={"action_pred": actions})
 

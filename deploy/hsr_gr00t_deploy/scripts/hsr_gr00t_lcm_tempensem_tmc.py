@@ -35,7 +35,7 @@ def compressedimage_to_array_lcm(msg):
 class HSRLcmServer:
     GRIPPER_OPEN = 1
     GRIPPER_CLOSE = 0
-    GRIPPER_CLOSE_THRESHOLD = 0.5  # グリッパーを閉じる閾値
+    GRIPPER_CLOSE_THRESHOLD = 0.9  # グリッパーを閉じる閾値
 
     def __init__(self, policy, traj_hz=10.0):
         self.traj_hz = float(traj_hz)
@@ -115,9 +115,10 @@ class Gr00tHSRPolicy:
 
     def __init__(
         self,
-        model_path: str = "/home/kohei/codes/matuolab/checkpoint-40000", 
+        model_path: str = "/home/veluga-g3/airoa/gr00t-microwave", 
         adopted_action_chunks: int = 15,
-        num_traj: int = 1
+        num_traj: int = 1,
+        use_temp_ensem: bool = True,
     ):
         assert num_traj <= adopted_action_chunks, "num_traj must be <= adopted_action_chunks"
         self.dagtconfig = data_config = DATA_CONFIG_MAP["hsr"]
@@ -132,10 +133,7 @@ class Gr00tHSRPolicy:
         )
         self.adopted_action_chunks = adopted_action_chunks
         self.action_queue = {
-            "action.arm": deque(maxlen=self.adopted_action_chunks),
-            "action.hand": deque(maxlen=self.adopted_action_chunks),
-            "action.head": deque(maxlen=self.adopted_action_chunks),
-            "action.base": deque(maxlen=self.adopted_action_chunks),   
+            "action.relative": deque(maxlen=self.adopted_action_chunks),  
         }
         #print(self.action_queue)
         self.num_traj = num_traj
@@ -147,6 +145,14 @@ class Gr00tHSRPolicy:
             "instruction": "Test prompt. Do not move.",
         }
         #self.reset_buffer()
+
+        # replay_episode = np.load("/home/veluga-g3/Downloads/episode_1511_action_relative.npz", allow_pickle=False)
+        # self.actions_rel = replay_episode["actions"]
+        self.frame_num = 0
+
+        self.use_temp_ensem = use_temp_ensem          # 無効にしたい時は False
+        self.temporal_half_life = 16        # フレーム半減期(=約10ステップで重み半減)
+        self._ema_action = None
     
     def reset_buffer(self):
         self.action_queue.clear()
@@ -178,24 +184,38 @@ class Gr00tHSRPolicy:
             ]
         """
         #print(self.action_queue)
-        if len(self.action_queue["action.arm"]) >= self.num_traj:
+        if len(self.action_queue["action.relative"]) >= self.num_traj:
             actions = []
             for _ in range(self.num_traj):
-                action_arm = self.action_queue["action.arm"].popleft()
-                action_hand = self.action_queue["action.hand"].popleft()
-                action_head = self.action_queue["action.head"].popleft()
-                action_base = self.action_queue["action.base"].popleft()
+                action_relative = self.action_queue["action.relative"].popleft()
+                #action_relative = self.actions_rel[self.frame_num]
                 action = np.concatenate(
                     [
-                        action_arm,
-                        [action_hand],
-                        action_head,
-                        action_base,
+                        action_relative[0:5],
+                        [action_relative[5]],
+                        #action_relative[7:9],
+                        #action_relative[9:12],
+                        action_relative[6:8],
+                        #[0.0,0.0],
+                        #[0,0],
+                        action_relative[8:11],
                     ]
                 )
+                self.frame_num += 1
+
                 action = action + np.concatenate(
                     [obs["joint_state"][:5], np.array([0]), obs["joint_state"][6:8], np.array([0, 0, 0])]
                 )
+
+                if self.use_temp_ensem:
+                    # half-life から EMA 係数 α を算出
+                    alpha = 1.0 - np.exp(-np.log(2) / max(1e-6, self.temporal_half_life))
+                    if self._ema_action is None:
+                        self._ema_action = action.astype(np.float64)
+                    else:
+                        self._ema_action = alpha * action + (1.0 - alpha) * self._ema_action
+                    action = self._ema_action
+
                 actions.append(action)
             return np.stack(actions)
 
@@ -217,25 +237,27 @@ class Gr00tHSRPolicy:
         }
         action_chunk = self.policy.get_action(policy_input)
         
-        self.action_queue["action.arm"].extend(action_chunk["action.arm"][self.num_traj:self.adopted_action_chunks])
-        self.action_queue["action.hand"].extend(action_chunk["action.hand"][self.num_traj:self.adopted_action_chunks])
-        self.action_queue["action.head"].extend(action_chunk["action.head"][self.num_traj:self.adopted_action_chunks])
-        self.action_queue["action.base"].extend(action_chunk["action.base"][self.num_traj:self.adopted_action_chunks])
-        
+        action_chunk["action.relative"][self.num_traj:self.adopted_action_chunks] = 
+        self.action_queue["action.relative"].extend(action_chunk["action.relative"][self.num_traj:self.adopted_action_chunks])
+    
         actions = []
         for i in range(self.num_traj):
-            action_arm = action_chunk["action.arm"][i]  # 最初のアクションだけを使用
-            action_hand = action_chunk["action.hand"][i]  # 最初のアクションだけを使用
-            action_head = action_chunk["action.head"][i]  # 最初のアクションだけを使用
-            action_base = action_chunk["action.base"][i]  # 最初のアクションだけを使用
+            action_relative = self.action_queue["action.relative"].popleft()
+            #action_relative = self.actions_rel[self.frame_num]
             action = np.concatenate(
                 [
-                    action_arm,
-                    [action_hand],
-                    action_head,
-                    action_base,
+                    action_relative[0:5],
+                    [action_relative[5]],
+                    #action_relative[7:9],
+                    #action_relative[9:12],
+                    action_relative[6:8],
+                    #[0.0,0.0],
+                    #[0,0],
+                    action_relative[8:11],
                 ]
             )
+
+            self.frame_num += 1
 
 
         
@@ -243,6 +265,15 @@ class Gr00tHSRPolicy:
             action = action + np.concatenate(
                 [obs["joint_state"][:5], np.array([0]), obs["joint_state"][6:8], np.array([0, 0, 0])]
             )
+
+            if self.use_temp_ensem:
+                alpha = 1.0 - np.exp(-np.log(2) / max(1e-6, self.temporal_half_life))
+                if self._ema_action is None:
+                    self._ema_action = action.astype(np.float64)
+                else:
+                    self._ema_action = alpha * action + (1.0 - alpha) * self._ema_action
+                action = self._ema_action
+
             actions.append(action)
         return np.array(actions)
 
@@ -251,23 +282,18 @@ def main():
     print("Start Issac-GR00T")
 
     # TODO: 引数でいい感じに処理するようにする
-    checkpoint_dir = "/home/hsr_pc5/group6/Isaac-GR00T/ckpt/gr00t-tmc"
+    #checkpoint_dir = "/home/hsr_pc5/group6/Isaac-GR00T/ckpt/2025-05-06-v3.0-success-only/refinetune-2025-05-06-07-steps-100000-lr-1e-5_bsz-16_workers-16_gpu-4_lr-1e-5_compile-None/checkpoint-99000"
+    #checkpoint_dir = "/home/hsr_pc5/group6/Isaac-GR00T/ckpt/2025-05-06-v3.0-success-only/refinetune-2025-05-06-07-steps-100000-lr-1e-5_bsz-16_workers-16_gpu-4_lr-1e-5_compile-None_hz-5/checkpoint-99000"
+    #checkpoint_dir = "/home/hsr_pc5/group6/Isaac-GR00T/ckpt/2025-05-06-v3.0-success-only/refinetune-2025-05-06-07-steps-100000-lr-1e-5_bsz-16_workers-16_gpu-4_lr-5e-5_compile-None/checkpoint-99000"
+    #checkpoint_dir = "/home/hsr_pc5/group6/Isaac-GR00T/ckpt/2025-05-06-v3.0-success-only/refinetune-2025-05-06-07-steps-100000-lr-1e-5_bsz-16_workers-16_gpu-4_lr-5e-5_compile-None_hz-5/checkpoint-99000"
+    checkpoint_dir = "/h, "hand_rgb.npyome/hsr_pc5/group6/Isaac-GR00T/ckpt/gr00t-tmc"
     adopted_action_chunks = 15
 
     print(f"checkpoint_dir: {checkpoint_dir}")
     print(f"adopted_action_chunks: {adopted_action_chunks}")
 
-    policy = Gr00tHSRPolicy(model_path=checkpoint_dir,adopted_action_chunks=adopted_action_chunks)
+    policy = Gr00tHSRPolicy(model_path=checkpoint_dir,adopted_action_chunks=adopted_action_chunks,use_temp_ensem=True)
 
-    # rand_img = np.random.randint(0, 256, (480, 640, 3), dtype=np.uint8)
-    # policy_input = {
-    #     "head_rgb": rand_img,
-    #     "hand_rgb": rand_img,
-    #     "joint_state": np.array([0.0 for _ in range(8)]),
-    #     "instruction": "Test prompt. Do not move.",
-    # }
-    # action = policy.act(policy_input)
-    # print(action)
 
     lcm_hsr_server = HSRLcmServer(policy)
 
