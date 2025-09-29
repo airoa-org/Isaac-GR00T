@@ -246,7 +246,8 @@ class Gr00tHSRPolicy:
                     action_relative[0:5],
                     [action_relative[5]],
                     #[0.5],
-                    action_relative[6:8],
+                    #action_relative[6:8],
+                    [0.0, 0.0],
                     action_relative[8:11],
                 ]
             )
@@ -284,7 +285,8 @@ class Gr00tHSRPolicy:
                     #[1.2],
                     #action_relative[7:9],
                     #action_relative[9:12],
-                    action_relative[6:8],
+                    #action_relative[6:8],
+                    [0.0, 0.0],
                     action_relative[8:11],
                 ]
             )
