@@ -18,7 +18,7 @@ from torch.utils.data import Subset
 import os
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Literal
 import numpy as np
@@ -27,7 +27,7 @@ import torch
 import tyro
 from transformers import TrainingArguments
 
-from gr00t.data.dataset import LeRobotMixtureDataset, LeRobotSingleDataset
+from gr00t.data.dataset import LeRobotMixtureDataset, LeRobotSingleDataset, LeRobotMultiEmbodimentMixtureDataset
 from gr00t.data.schema import EmbodimentTag
 from gr00t.experiment.data_config import DATA_CONFIG_MAP
 from gr00t.experiment.runner import TrainRunner
@@ -51,7 +51,7 @@ class ArgsConfig:
     output_dir: str = "/tmp/gr00t"
     """Directory to save model checkpoints."""
 
-    data_config: Literal[tuple(DATA_CONFIG_MAP.keys())] = "fourier_gr1_arms_only"
+    data_config: List[Literal[tuple(DATA_CONFIG_MAP.keys())]] = field(default_factory=list)
     """Data configuration name from DATA_CONFIG_MAP, we assume all datasets have the same data config"""
 
     # Training parameters
@@ -115,7 +115,7 @@ class ArgsConfig:
     """Where to report training metrics (e.g., 'wandb', 'tensorboard', 'azure_ml')."""
 
     # Data loading parameters
-    embodiment_tag: Literal[tuple(EMBODIMENT_TAG_MAPPING.keys())] = "new_embodiment"
+    embodiment_tag: List[Literal[tuple(EMBODIMENT_TAG_MAPPING.keys())]] = field(default_factory=list)
     """Embodiment tag to use for training. e.g. 'new_embodiment', 'gr1'"""
 
     video_backend: Literal["decord", "torchvision_av"] = "decord"
@@ -167,12 +167,20 @@ def main(config: ArgsConfig):
     #include_eps = list(range(1511,2143))
     """Main training function."""
     # ------------ step 1: load dataset ------------
-    embodiment_tag = EmbodimentTag(config.embodiment_tag)
+    embodiment_tags = []
+    for tag in config.embodiment_tag:
+        embodiment_tag = EmbodimentTag(tag)
+        embodiment_tags.append(embodiment_tag)
 
     # 1.1 modality configs and transforms
-    data_config_cls = DATA_CONFIG_MAP[config.data_config]
-    modality_configs = data_config_cls.modality_config()
-    transforms = data_config_cls.transform()
+    data_config_clss = []
+    modality_configss = []
+    transformss = []
+    for data_config in config.data_config:
+        data_config_cls = DATA_CONFIG_MAP[data_config]
+        data_config_clss.append(data_config_cls)
+        modality_configss.append(data_config_cls.modality_config())
+        transformss.append(data_config_cls.transform())
 
     # 1.2 data loader: we will use either single dataset or mixture dataset
     if len(config.dataset_path) == 1:
@@ -188,22 +196,24 @@ def main(config: ArgsConfig):
         )
     else:
         single_datasets = []
+        embs = 0
         for p in config.dataset_path:
             assert os.path.exists(p), f"Dataset path {p} does not exist"
             ## We use the same transforms, modality configs, and embodiment tag for all datasets here,
             ## in reality, you can use dataset from different modalities and embodiment tags
             dataset = LeRobotSingleDataset(
                 dataset_path=p,
-                modality_configs=modality_configs,
-                transforms=transforms,
-                embodiment_tag=embodiment_tag,
+                modality_configs=modality_configss[embs],
+                transforms=transformss[embs],
+                embodiment_tag=embodiment_tags[embs],
                 video_backend=config.video_backend,
                 sample_every_n=config.sample_every_n,
                 target_fps=config.target_fps,
             )
             single_datasets.append(dataset)
+            embs += 1
 
-        train_dataset = LeRobotMixtureDataset(
+        train_dataset = LeRobotMultiEmbodimentMixtureDataset(
             data_mixture=[
                 (dataset, 1.0)  # we will use equal weights for all datasets
                 for dataset in single_datasets
@@ -214,7 +224,7 @@ def main(config: ArgsConfig):
             seed=42,
             metadata_config={
                 "percentile_mixing_method": "weighted_average",
-            },
+            }
         )
         print(f"Loaded {len(single_datasets)} datasets, with {config.dataset_path} ")
 

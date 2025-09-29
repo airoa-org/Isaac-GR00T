@@ -20,7 +20,7 @@ from pathlib import Path
 import torch
 from transformers import TrainingArguments, set_seed
 
-from gr00t.data.dataset import LeRobotMixtureDataset, LeRobotSingleDataset
+from gr00t.data.dataset import LeRobotMixtureDataset, LeRobotSingleDataset, LeRobotMultiEmbodimentMixtureDataset
 from gr00t.experiment.trainer import DualBrainTrainer
 from gr00t.model.gr00t_n1 import GR00T_N1_5
 from gr00t.model.transforms import DefaultDataCollator
@@ -35,7 +35,7 @@ class TrainRunner:
         self,
         model: GR00T_N1_5,
         training_args: TrainingArguments,
-        train_dataset: LeRobotSingleDataset | LeRobotMixtureDataset,
+        train_dataset: LeRobotSingleDataset | LeRobotMixtureDataset | LeRobotMultiEmbodimentMixtureDataset,
         resume_from_checkpoint: bool = False,
     ):
         self.training_args = training_args
@@ -78,6 +78,34 @@ class TrainRunner:
                 metadata_json.update(
                     {train_dataset.tag: train_dataset.metadata.model_dump(mode="json")}
                 )
+            elif hasattr(train_dataset, "per_dataset_metadatas") and hasattr(train_dataset, "per_embodiment_metadatas"):
+                #by_ds = {name: m.model_dump(mode="json")
+                #        for name, m in train_dataset.per_dataset_metadatas().items()}
+                #by_tag = {}
+                #for tag, metas in train_dataset.per_embodiment_metadatas().items():
+                #    by_tag[str(tag)] = [m.model_dump(mode="json") for m in metas]
+                by_tag: dict[str, dict[str, dict]] = {}
+                for ds in train_dataset.datasets:
+                    tag_str = getattr(ds.metadata.embodiment_tag, "value", str(ds.metadata.embodiment_tag))
+                    entry = by_tag.setdefault(tag_str, {})
+                    entry = ds.metadata.model_dump(mode="json")
+
+                blob = by_tag
+                print(blob)
+                # 旧互換: もし merged_metadata を持っていれば併記
+                if hasattr(train_dataset, "merged_metadata"):
+                    blob["merged_by_tag"] = {
+                        str(tag): m.model_dump(mode="json")
+                        for tag, m in train_dataset.merged_metadata.items()
+                    }
+                def _merge_dict(dst, src):
+                    for k, v in src.items():
+                        if isinstance(v, dict) and isinstance(dst.get(k), dict):
+                            _merge_dict(dst[k], v)
+                        else:
+                            dst[k] = v
+                #_merge_dict(metadata_json, blob)
+                metadata_json.update(blob)
             elif isinstance(train_dataset, LeRobotMixtureDataset):
                 metadata_json.update(
                     {

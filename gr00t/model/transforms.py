@@ -82,6 +82,84 @@ def collate(features: List[dict], eagle_processor) -> dict:
             batch[key] = torch.from_numpy(np.stack(values))
     return batch
 
+def collate_new(features, eagle_processor=None):
+    batch = {}
+    keys = features[0].keys()
+
+    for key in keys:
+        values = [f[key] for f in features]
+        v0 = values[0]
+
+        # --- 画像（video.*）を処理して pixel_values と image_sizes を用意 ---
+        if key.startswith("video."):
+            if eagle_processor is not None:
+                imgs = []
+                img_sizes = []
+                for v in values:
+                    # v: np.ndarray (T,H,W,C) or (H,W,C)
+                    if isinstance(v, np.ndarray):
+                        if v.ndim == 4:   # (T,H,W,C)
+                            img = v[0]    # 代表フレーム（必要に応じて別ルールに）
+                        elif v.ndim == 3: # (H,W,C)
+                            img = v
+                        else:
+                            raise ValueError(f"Unexpected image shape for {key}: {v.shape}")
+                        H, W = int(img.shape[0]), int(img.shape[1])
+                        imgs.append(img)
+                        img_sizes.append((H, W))
+                    else:
+                        # PIL.Image などでもOKならここでそのまま追加
+                        # ただしサイズは取っておく
+                        H, W = v.size[1], v.size[0]  # PIL は (W,H)
+                        imgs.append(v)
+                        img_sizes.append((H, W))
+
+                proc = eagle_processor(images=imgs, return_tensors="pt")
+                # processor が image_sizes を返すタイプならそれを採用
+                if "image_sizes" in proc:
+                    batch["image_sizes"] = proc["image_sizes"]
+                else:
+                    # 無ければ自作したサイズを入れる（list[tuple] -> tensor化は後段でOK）
+                    batch["image_sizes"] = img_sizes
+                # pixel_values は必須想定
+                batch["pixel_values"] = proc["pixel_values"]
+            else:
+                # processor を使わない場合はそのまま積む
+                try:
+                    batch[key] = torch.from_numpy(np.stack(values))
+                except Exception:
+                    batch[key] = values
+            continue
+
+        # --- 言語（文字列）は前の修正どおりテンソル化しない ---
+        if key.startswith("annotation.") or key.startswith("language."):
+            # ...（前回の文字列処理のままでOK）
+            # eagle_processor でテキストをトークナイズするならここで:
+            # tok = eagle_processor(text=[...], ...)
+            # batch["input_ids"] = tok["input_ids"]; ...
+            continue
+
+        # --- 数値配列/テンソル処理（前回どおり） ---
+        if isinstance(v0, np.ndarray):
+            if v0.dtype.kind in ("U", "S", "O"):
+                batch[key] = values
+                continue
+            try:
+                batch[key] = torch.from_numpy(np.stack(values))
+            except Exception:
+                batch[key] = values
+            continue
+
+        if torch.is_tensor(v0):
+            try:
+                batch[key] = torch.stack(values, dim=0)
+            except Exception:
+                batch[key] = values
+            continue
+
+        batch[key] = values
+
+    return batch
 
 class DefaultDataCollator(DataCollatorMixin):
     def __init__(self, eagle_path: str = DEFAULT_EAGLE_PATH):

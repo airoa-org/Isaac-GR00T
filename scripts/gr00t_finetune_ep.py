@@ -140,7 +140,8 @@ class ArgsConfig:
 
 def main(config: ArgsConfig):
 
-    include_eps = list(range(1511,2143))
+    #include_eps = list(range(1511,2143))
+    include_eps = None
     """Main training function."""
     # ------------ step 1: load dataset ------------
     embodiment_tag = EmbodimentTag(config.embodiment_tag)
@@ -174,6 +175,9 @@ def main(config: ArgsConfig):
                 transforms=transforms,
                 embodiment_tag=embodiment_tag,
                 video_backend=config.video_backend,
+                include_episodes=include_eps,
+                sample_every_n=config.sample_every_n,
+                target_fps=config.target_fps,
             )
             single_datasets.append(dataset)
 
@@ -194,6 +198,7 @@ def main(config: ArgsConfig):
 
     # ------------ step 2: load model ------------
     # First, get the data config to determine action horizon
+    import sys; sys.exit()
     data_action_horizon = len(data_config_cls.action_indices)
 
     # Load model

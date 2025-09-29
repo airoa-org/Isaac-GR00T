@@ -23,7 +23,7 @@ In this file, we define 3 types of datasets:
 
 See `scripts/load_dataset.py` for examples on how to use these datasets.
 """
-
+from __future__ import annotations
 import hashlib
 import json
 from collections import defaultdict
@@ -46,6 +46,19 @@ from .schema import (
     LeRobotStateActionMetadata,
 )
 from .transform import ComposedModalityTransform
+
+
+from pathlib import Path
+from typing import Dict, List, Tuple
+import numpy as np
+import pandas as pd
+from tqdm import tqdm
+import math
+import os
+import re
+import shutil
+import tempfile
+
 
 LE_ROBOT_MODALITY_FILENAME = "meta/modality.json"
 LE_ROBOT_EPISODE_FILENAME = "meta/episodes.jsonl"
@@ -91,6 +104,279 @@ def calculate_dataset_statistics(parquet_paths: list[Path]) -> dict:
             "q99": np.quantile(np_data, 0.99, axis=0).tolist(),
         }
     return dataset_statistics
+
+# ---------- ユーティリティ ----------
+
+from pathlib import Path
+from typing import Dict, List, Tuple, Iterable
+import numpy as np
+import pyarrow as pa
+import pyarrow.parquet as pq
+from tqdm import tqdm
+import heapq, math, os, re, tempfile, shutil
+
+# ========= ユーティリティ =========
+
+def _safe_name(name: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", name)
+
+def _infer_dim_from_arrow_array(arr: pa.Array) -> int | None:
+    # 変更前:
+    # for i in range(len(arr)):
+    #     if arr.is_valid(i):
+    #         v = arr[i].as_py()
+    #         ...
+
+    # 変更後:
+    for scalar in arr:              # scalar: pa.Scalar
+        v = scalar.as_py()          # None なら欠損
+        if v is None or isinstance(v, (str, bytes)):
+            continue
+        a = np.asarray(v)
+        return 1 if a.ndim == 0 else int(np.prod(a.shape))
+    return None
+
+def _flatten_to_length(v, dim: int) -> np.ndarray | None:
+    """v -> float32[dim]（形が合わなければ None）。"""
+    if v is None or isinstance(v, (str, bytes)):
+        return None
+    a = np.asarray(v)
+    # object や不正は弾く
+    try:
+        a = a.astype(np.float32, copy=False)
+    except Exception:
+        return None
+    a = a.reshape(-1) if a.ndim > 0 else a.reshape(1)
+    if a.shape[0] != dim:
+        return None
+    return a
+
+class WelfordVec:
+    def __init__(self, dim: int):
+        self.dim = dim
+        self.n = 0
+        self.mean = np.zeros(dim, dtype=np.float64)
+        self.M2 = np.zeros(dim, dtype=np.float64)
+        self.vmin = np.full(dim, np.inf, dtype=np.float64)
+        self.vmax = np.full(dim, -np.inf, dtype=np.float64)
+    def update(self, X: np.ndarray):  # X: (B,dim) float32/64
+        X = X.astype(np.float64, copy=False)
+        self.vmin = np.minimum(self.vmin, np.min(X, axis=0))
+        self.vmax = np.maximum(self.vmax, np.max(X, axis=0))
+        b = X.shape[0]
+        n0 = self.n
+        self.n = n0 + b
+        delta = X - self.mean
+        self.mean = self.mean + np.sum(delta, axis=0) / self.n
+        delta2 = X - self.mean
+        self.M2 = self.M2 + np.sum(delta * delta2, axis=0)
+    def finalize(self):
+        if self.n < 2:
+            std = np.zeros(self.dim, dtype=np.float64)
+        else:
+            var = self.M2 / (self.n - 1)
+            std = np.sqrt(np.maximum(var, 0.0))
+        return (self.mean.astype(np.float32),
+                std.astype(np.float32),
+                self.vmin.astype(np.float32),
+                self.vmax.astype(np.float32),
+                int(self.n))
+
+# ========= 外部ソートで分位（線形補間） =========
+
+def _write_sorted_runs(values: Iterable[float], run_size: int, tmpdir: Path) -> List[Path]:
+    """values を run_size ごとに集めて in-memory sort → .npy（昇順）として保存。"""
+    runs = []
+    buf = []
+    for v in values:
+        buf.append(v)
+        if len(buf) >= run_size:
+            arr = np.asarray(buf, dtype=np.float32)
+            arr.sort(kind="quicksort")
+            run_path = tmpdir / f"run_{len(runs):06d}.npy"
+            np.save(run_path, arr)
+            runs.append(run_path)
+            buf.clear()
+    if buf:
+        arr = np.asarray(buf, dtype=np.float32)
+        arr.sort(kind="quicksort")
+        run_path = tmpdir / f"run_{len(runs):06d}.npy"
+        np.save(run_path, arr)
+        runs.append(run_path)
+    return runs
+
+def _kth_from_sorted_runs(run_paths: List[Path], k: int) -> float:
+    """昇順ラン群の k 番目（0-index）の値を k-way merge で取得。"""
+    # 各 run をメモリに丸ごと載せず、必要になったらチャンク読みでもOK。
+    # ここでは各 run を mmap で読む（OS に任せる）。
+    arrays = [np.load(p, mmap_mode="r") for p in run_paths]
+    # ポインタと値で min-heap を作る
+    heap = []
+    for i, arr in enumerate(arrays):
+        if arr.size > 0:
+            heap.append((arr[0], i, 0))  # (value, run_id, index_in_run)
+    heapq.heapify(heap)
+    popped = -1
+    while heap:
+        val, rid, idx = heapq.heappop(heap)
+        popped += 1
+        if popped == k:
+            return float(val)
+        nxt = idx + 1
+        if nxt < arrays[rid].size:
+            heapq.heappush(heap, (arrays[rid][nxt], rid, nxt))
+    raise IndexError("k is out of range")
+
+def _quantile_linear_from_runs(run_paths: List[Path], q: float, N: int) -> float:
+    """NumPy の method='linear' と一致（pos=q*(N-1), 線形補間）。"""
+    if N == 0:
+        return float("nan")
+    if q <= 0.0:
+        return float(np.load(run_paths[0], mmap_mode="r")[0])
+    if q >= 1.0:
+        # 最大は各 run の末尾の最大値
+        mx = -np.inf
+        for p in run_paths:
+            a = np.load(p, mmap_mode="r")
+            if a.size:
+                mx = max(mx, float(a[-1]))
+        return mx
+    pos = q * (N - 1)
+    k = int(math.floor(pos))
+    r = pos - k
+    vk  = _kth_from_sorted_runs(run_paths, k)
+    if r == 0.0:
+        return vk
+    vk1 = _kth_from_sorted_runs(run_paths, k + 1)
+    return (1.0 - r) * vk + r * vk1
+
+# ========= 本体：厳密＆低RAM =========
+
+def calculate_dataset_statistics_exact_streaming(
+    parquet_paths: List[Path],
+    *,
+    tmpdir: str | None = None,
+    keep_tmp: bool = False,
+    read_columns: List[str] | None = None,
+    batch_rows: int = 100_000,     # Arrowの record batch サイズ（RAM に合わせて）
+    run_size: int = 5_000_000      # 1 ランの要素数（RAM に合わせて調整）
+) -> Dict[str, dict]:
+    """
+    - 読み込みは Arrow の iter_batches で本当のストリーミング
+    - mean/std/min/max は Welford（厳密）
+    - q01/q99 は外部ソート＋k-way merge で厳密（NumPy の線形補間一致）
+    - 列×次元を “順番に” 処理（同時保持しない）
+    """
+    if not parquet_paths:
+        return {}
+
+    # 作業ディレクトリ
+    own_tmp = False
+    if tmpdir is None:
+        work_dir = Path(tempfile.mkdtemp(prefix="parq_stats_extsort_"))
+        own_tmp = True
+    else:
+        work_dir = Path(tmpdir); work_dir.mkdir(parents=True, exist_ok=True)
+
+    # 列一覧（スキーマは最初のファイルから）
+    first_pq = pq.ParquetFile(str(parquet_paths[0]))
+    cols_all = [m.name for m in first_pq.schema_arrow]
+    target_cols = read_columns if read_columns is not None else cols_all
+
+    results: Dict[str, dict] = {}
+
+    # 列を1つずつ処理
+    for col in target_cols:
+        # 次元推定（最初のファイルの先頭の有効セルから）
+        dim = None
+        for pf_path in parquet_paths:
+            pf = pq.ParquetFile(str(pf_path))
+            for batch in pf.iter_batches(columns=[col], batch_size=batch_rows):
+                arr: pa.Array = batch.column(0)
+                dim = _infer_dim_from_arrow_array(arr)
+                if dim is not None:
+                    break
+            if dim is not None:
+                break
+        if dim is None:
+            # 数値でなさそう（文字列など）→ スキップ
+            continue
+
+        # 統計器
+        w = WelfordVec(dim)
+        N_total = 0
+
+        # --- パス1: Welford 集計 + 件数 N の把握 ---
+        for pf_path in tqdm(parquet_paths, desc=f"[Pass1] {col}"):
+            pf = pq.ParquetFile(str(pf_path))
+            for batch in pf.iter_batches(columns=[col], batch_size=batch_rows):
+                arr: pa.Array = batch.column(0)
+                mats = []
+                # Arrow Array を Python 値で取り出す（ゼロコピーではないが安全）
+                for i in range(len(arr)):
+                    v = arr[i].as_py()          # ← is_valid(i) を使わない
+                    a = _flatten_to_length(v, dim)
+                    if a is not None:
+                        mats.append(a)
+                if mats:
+                    X = np.vstack(mats)  # チャンク内のみ
+                    w.update(X)
+                    N_total += X.shape[0]
+
+        if N_total == 0:
+            # 空列
+            results[col] = {
+                "mean": [0.0]*dim, "std": [0.0]*dim, "min": [np.inf]*dim, "max": [-np.inf]*dim,
+                "count": 0, "q01": [], "q99": [],
+            }
+            continue
+
+        mean, std, vmin, vmax, _ = w.finalize()
+
+        # --- パス2: 各次元ごとに外部ソートの「ラン」を作る ---
+        q01 = np.empty(dim, dtype=np.float32)
+        q99 = np.empty(dim, dtype=np.float32)
+
+        for d in range(dim):
+            dim_dir = work_dir / f"{_safe_name(col)}__d{d}"
+            dim_dir.mkdir(parents=True, exist_ok=True)
+
+            def value_stream() -> Iterable[float]:
+                for pf_path in parquet_paths:
+                    pf = pq.ParquetFile(str(pf_path))
+                    for batch in pf.iter_batches(columns=[col], batch_size=batch_rows):
+                        arr: pa.Array = batch.column(0)
+                        for i in range(len(arr)):
+                            v = arr[i].as_py()
+                            a = _flatten_to_length(v, dim)
+                            if a is not None:
+                                yield float(a[d])
+
+            run_paths = _write_sorted_runs(value_stream(), run_size=run_size, tmpdir=dim_dir)
+            # 厳密分位（線形補間）
+            q01[d] = _quantile_linear_from_runs(run_paths, 0.01, N_total)
+            q99[d] = _quantile_linear_from_runs(run_paths, 0.99, N_total)
+
+            # ランは次元ごとに削除（中間ファイルを増やし過ぎない）
+            if not keep_tmp:
+                shutil.rmtree(dim_dir, ignore_errors=True)
+
+        results[col] = {
+            "mean": mean.tolist(),
+            "std": std.tolist(),
+            "min": vmin.tolist(),
+            "max": vmax.tolist(),
+            "count": int(N_total),
+            "q01": q01.tolist(),
+            "q99": q99.tolist(),
+        }
+
+    if own_tmp and not keep_tmp:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+    return results
+
+
 
 
 class ModalityConfig(BaseModel):
@@ -278,8 +564,8 @@ class LeRobotSingleDataset(Dataset):
         """
 
         # 1. Modality metadata
-        #modality_meta_path = self.dataset_path / LE_ROBOT_MODALITY_FILENAME
-        modality_meta_path = "/home/group_25b505/group_6/workspace/user_00031_25b505/Isaac-GR00T/modality.json"
+        modality_meta_path = self.dataset_path / LE_ROBOT_MODALITY_FILENAME
+        #modality_meta_path = "/home/group_25b505/group_6/workspace/user_00031_25b505/Isaac-GR00T/modality.json"
         #assert (
         #    modality_meta_path.exists()
         #), f"Please provide a {LE_ROBOT_MODALITY_FILENAME} file in {self.dataset_path}"
@@ -326,11 +612,11 @@ class LeRobotSingleDataset(Dataset):
             # NOTE(FH): different lerobot dataset versions have different keys for the number of channels and fps
             try:
                 channels = le_video_meta["shape"][le_video_meta["names"].index("channel")]
-                #fps = le_video_meta["video_info"]["video.fps"]
-                fps = le_video_meta["info"]["video.fps"]
+                fps = le_video_meta["video_info"]["video.fps"]
+                #fps = le_video_meta["info"]["video.fps"]
             except (ValueError, KeyError):
-                #channels = le_video_meta["shape"][le_video_meta["names"].index("channels")]
-                channels = le_video_meta["info"]["video.channels"]
+                channels = le_video_meta["shape"][le_video_meta["names"].index("channels")]
+                #channels = le_video_meta["info"]["video.channels"]
                 fps = le_video_meta["info"]["video.fps"]
             simplified_modality_meta["video"][new_key] = {
                 "resolution": [width, height],
@@ -341,8 +627,8 @@ class LeRobotSingleDataset(Dataset):
         self.fps = fps
 
         # 2. Dataset statistics
-        #stats_path = self.dataset_path / LE_ROBOT_STATS_FILENAME
-        stats_path = "/home/group_25b505/group_6/workspace/user_00031_25b505/Isaac-GR00T/stats.json"
+        stats_path = self.dataset_path / LE_ROBOT_STATS_FILENAME
+        #stats_path = "/home/group_25b505/group_6/workspace/user_00031_25b505/Isaac-GR00T/stats.json"
         try:
             with open(stats_path, "r") as f:
                 le_statistics = json.load(f)
@@ -353,7 +639,8 @@ class LeRobotSingleDataset(Dataset):
             print(f"Calculating dataset statistics for {self.dataset_name}")
             # Get all parquet files in the dataset paths
             parquet_files = list((self.dataset_path).glob(LE_ROBOT_DATA_FILENAME))
-            le_statistics = calculate_dataset_statistics(parquet_files)
+            #le_statistics = calculate_dataset_statistics(parquet_files)
+            le_statistics = calculate_dataset_statistics_exact_streaming(parquet_files)
             with open(stats_path, "w") as f:
                 json.dump(le_statistics, f, indent=4)
         dataset_statistics = {}
@@ -500,8 +787,8 @@ class LeRobotSingleDataset(Dataset):
 
     def _get_lerobot_modality_meta(self) -> LeRobotModalityMetadata:
         """Get the metadata for the LeRobot dataset."""
-        #modality_meta_path = self.dataset_path / LE_ROBOT_MODALITY_FILENAME
-        modality_meta_path = "/home/group_25b505/group_6/workspace/user_00031_25b505/Isaac-GR00T/modality.json"
+        modality_meta_path = self.dataset_path / LE_ROBOT_MODALITY_FILENAME
+        #modality_meta_path = "/home/group_25b505/group_6/workspace/user_00031_25b505/Isaac-GR00T/modality.json"
         #assert (
         #    modality_meta_path.exists()
         #), f"Please provide a {LE_ROBOT_MODALITY_FILENAME} file in {self.dataset_path}"
@@ -1580,3 +1867,245 @@ class LeRobotMixtureDataset(Dataset):
             )
         for dataset in self.datasets:
             dataset.set_transforms_metadata(self.merged_metadata[dataset.tag])
+
+from dataclasses import dataclass
+from typing import Any
+
+# Import from your tree
+# from .dataset import LeRobotSingleDataset, DatasetMetadata
+
+
+@dataclass
+class _MixtureItem:
+    ds: "LeRobotSingleDataset"
+    weight: float
+
+
+class LeRobotMultiEmbodimentMixtureDataset(Dataset):
+    """
+    Mixture dataset that **does not merge** stats/modality metadata across datasets
+    (i.e., supports *multi‑embodiment* cleanly). Each underlying dataset keeps its
+    own `metadata` (stats, modality.json) and `embodiment_tag`.
+
+    Key differences vs. LeRobotMixtureDataset:
+    - No aggregation of statistics or modalities. No `update_metadata()`.
+    - `__getitem__` returns a sample **plus** `embodiment_tag` and `dataset_name` so
+      downstream code can branch on embodiment when needed (e.g., per‑embodiment heads,
+      different normalizers, etc.).
+    - Sampling and epoch behavior are unchanged from your original mixture (stratified by
+      dataset weights and within‑dataset trajectory lengths if desired).
+
+    Assumptions:
+    - Each `LeRobotSingleDataset` instance already called `set_transforms_metadata(dataset.metadata)`
+      inside its constructor (as in your current implementation). Thus per‑dataset transforms
+      see the correct per‑embodiment stats and modality config.
+    - Your model/collator can accept heterogeneous modality key‑sets. If you need padding/union
+      behavior, see `multiembodiment_collate` below.
+    """
+
+    def __init__(
+        self,
+        data_mixture: Sequence[Tuple["LeRobotSingleDataset", float]],
+        mode: str,
+        balance_dataset_weights: bool = True,
+        balance_trajectory_weights: bool = True,
+        seed: int = 42,
+        metadata_config: dict | None = None,
+    ) -> None:
+        super().__init__()
+        assert mode in {"train", "val", "test"}
+
+        self._mixture: List[_MixtureItem] = [
+            _MixtureItem(ds=ds, weight=float(w)) for (ds, w) in data_mixture
+        ]
+        self.mode = mode
+        self.balance_dataset_weights = balance_dataset_weights
+        self.balance_trajectory_weights = balance_trajectory_weights
+        self.seed = seed
+
+        # 1) dataset lengths (number of *steps*, not number of trajectories)
+        self._dataset_lengths = np.array([len(m.ds) for m in self._mixture], dtype=np.int64)
+
+        # 2) sampling weights across datasets
+        self._dataset_sampling_weights = np.array([m.weight for m in self._mixture], dtype=np.float64)
+        if self.balance_dataset_weights:
+            self._dataset_sampling_weights *= self._dataset_lengths
+        sw = self._dataset_sampling_weights.sum()
+        if sw <= 0:
+            raise ValueError("All dataset weights are zero.")
+        self._dataset_sampling_weights /= sw
+
+        # 3) trajectory sampling weights per dataset
+        self._traj_sampling_weights: List[np.ndarray] = []
+        for m in self._mixture:
+            traj_w = np.ones(len(m.ds.trajectory_lengths), dtype=np.float64)
+            if self.balance_trajectory_weights:
+                traj_w *= m.ds.trajectory_lengths
+            s = traj_w.sum()
+            if s <= 0:
+                raise ValueError(f"Dataset {m.ds.dataset_name} has no trajectories.")
+            traj_w /= s
+            self._traj_sampling_weights.append(traj_w)
+
+        # 4) choose a primary length to define __len__ (like original impl)
+        #    We emulate the same behavior: epochs are as long as the *largest*
+        #    effective dataset once divided by its sampling weight.
+        mask = self._dataset_sampling_weights > 0
+        if not np.any(mask):
+            raise ValueError("All dataset sampling weights are zero after normalization.")
+        eff = self._dataset_lengths[mask] / self._dataset_sampling_weights[mask]
+        self._epoch_len = int(np.ceil(eff.max()))
+
+        self.set_epoch(0)
+
+        self.merged_metadata: dict[str, DatasetMetadata] = {}
+        seen: set[str] = set()
+        for ds in self._mixture:
+            tag = ds.ds.metadata.embodiment_tag
+            key = tag.value if hasattr(tag, "value") else str(tag)
+            if key not in seen:
+                self.merged_metadata[key] = ds.ds.metadata
+                seen.add(key)
+
+    # ---------- Public helpers ----------
+    @property
+    def dataset_lengths(self) -> np.ndarray:
+        return self._dataset_lengths
+
+    @property
+    def dataset_sampling_weights(self) -> np.ndarray:
+        return self._dataset_sampling_weights
+    @property
+    def datasets(self):
+        # TrainRunner 互換: List[LeRobotSingleDataset] を返す
+        return [m.ds for m in self._mixture]
+
+    def per_embodiment_metadatas(self) -> Dict[str, List["DatasetMetadata"]]:
+        """Return *all* metadatas grouped by embodiment_tag (no merging).
+        Note: multiple datasets can share the same tag but have different modality.json;
+        we therefore return a LIST per tag.
+        """
+        out: Dict[str, List["DatasetMetadata"]] = {}
+        for m in self._mixture:
+            tag = m.ds.metadata.embodiment_tag
+            out.setdefault(tag.value, []).append(m.ds.metadata)
+        return out
+
+    def per_dataset_metadatas(self) -> Dict[str, "DatasetMetadata"]:
+        """Return metadata keyed by dataset name (useful if multiple datasets share a tag)."""
+        out: Dict[str, "DatasetMetadata"] = {}
+        for m in self._mixture:
+            out[m.ds.dataset_name] = m.ds.metadata
+        return out
+
+    # ---------- Epoch / sampling ----------
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+
+    def __len__(self) -> int:
+        return self._epoch_len
+
+    def _rng_for_index(self, index: int) -> np.random.Generator:
+        seed = index if self.mode != "train" else _safe_hash((self.epoch, index, self.seed))
+        return np.random.default_rng(seed)
+
+    def _sample_step(self, index: int) -> tuple["LeRobotSingleDataset", int, int]:
+        rng = self._rng_for_index(index)
+        # choose dataset
+        ds_idx = rng.choice(len(self._mixture), p=self._dataset_sampling_weights)
+        m = self._mixture[int(ds_idx)]
+        ds = m.ds
+        # choose trajectory inside ds
+        traj_idx = rng.choice(len(ds.trajectory_ids), p=self._traj_sampling_weights[int(ds_idx)])
+        traj_id = int(ds.trajectory_ids[int(traj_idx)])
+        # choose base step inside that trajectory
+        base = int(rng.choice(ds.trajectory_lengths[int(traj_idx)]))
+        return ds, traj_id, base
+
+    # def sample_step(self, index: int) -> tuple[LeRobotSingleDataset, int, int]:
+    #     rng = self._rng_for_index(index)
+    #     # dataset
+    #     ds_idx = int(rng.choice(len(self.datasets), p=self.dataset_sampling_weights))
+    #     ds = self.datasets[ds_idx]
+    #     # trajectory
+    #     traj_idx = int(rng.choice(len(ds.trajectory_ids), p=self.trajectory_sampling_weights[ds_idx]))
+    #     traj_id = int(ds.trajectory_ids[traj_idx])
+    #     # step
+    #     base_index = int(rng.choice(ds.trajectory_lengths[traj_idx]))
+    #     return ds, traj_id, base_index
+
+    # def __getitem__(self, index: int) -> Dict[str, Any]:
+    #     ds, traj_id, base = self._sample_step(index)
+    #     sample = ds.get_step_data(traj_id, base)
+    #     # apply per‑dataset transforms (already owning correct per‑embodiment metadata)
+    #     sample = ds.transforms(sample)
+    #     # Attach identification for downstream routing
+    #     sample["embodiment_tag"] = str(ds.metadata.embodiment_tag)
+    #     sample["dataset_name"] = ds.dataset_name
+    #     sample["episode_index"] = int(traj_id)  # helpful for logging/debug
+    #     sample["__base_index"] = int(base)
+    #     return sample
+    
+    def __getitem__(self, index: int) -> dict:
+        ds, traj_id, base = self._sample_step(index)
+        sample = ds.get_step_data(traj_id, base)
+        sample = ds.transforms(sample)  # ← 各DSが自前のmetadataを見て動く
+        # 下流でルーティングしやすい識別情報を付与（数値のままでもOK）
+        #tag = ds.metadata.embodiment_tag
+        #sample["embodiment_tag"] = tag.value if hasattr(tag, "value") else str(tag)
+        #sample["dataset_name"]   = ds.dataset_name
+        #sample["episode_index"]  = int(traj_id)
+        #sample["__base_index"]   = int(base)
+        return sample
+
+    # def per_embodiment_metadatas(self) -> dict[str, list[DatasetMetadata]]:
+    #     out: dict[str, list[DatasetMetadata]] = {}
+    #     for ds in self.datasets:
+    #         tag = ds.metadata.embodiment_tag
+    #         key = tag.value if hasattr(tag, "value") else str(tag)
+    #         out.setdefault(key, []).append(ds.metadata)
+    #     return out
+
+    # def per_dataset_metadatas(self) -> dict[str, DatasetMetadata]:
+    #     return {ds.dataset_name: ds.metadata for ds in self.datasets}
+
+    
+
+
+# ---------- Optional: tolerant collate for heterogeneous modalities ----------
+# This keeps per‑key tensors that can stack cleanly; for keys with mismatched shapes
+# or non‑ndarray types (e.g., lists of strings), it keeps them as a Python list.
+# Replace with your project’s collator if you already have one.
+
+def multiembodiment_collate(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
+    import torch
+    out: Dict[str, Any] = {}
+    keys = set().union(*(b.keys() for b in batch))
+    for k in keys:
+        vals = [b.get(k) for b in batch]
+        # Try to stack numpy/torch arrays of identical shape
+        try:
+            if isinstance(vals[0], torch.Tensor):
+                if all((v is not None) and isinstance(v, torch.Tensor) and v.shape == vals[0].shape for v in vals):
+                    out[k] = torch.stack(vals, dim=0)
+                else:
+                    out[k] = vals
+            elif hasattr(vals[0], "shape"):
+                arrs = [torch.as_tensor(v) for v in vals]
+                if all(a.shape == arrs[0].shape for a in arrs):
+                    out[k] = torch.stack(arrs, dim=0)
+                else:
+                    out[k] = vals
+            else:
+                out[k] = vals
+        except Exception:
+            out[k] = vals
+    return out
+
+
+# ---------- small utility ----------
+
+def _safe_hash(tup) -> int:
+    import hashlib
+    s = repr(tup).encode("utf-8")
+    return int(hashlib.sha256(s).hexdigest(), 16) & 0xFFFFFFFF

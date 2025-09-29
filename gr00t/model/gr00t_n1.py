@@ -181,6 +181,7 @@ class GR00T_N1_5(PreTrainedModel):
 
     def prepare_input(self, inputs) -> Tuple[BatchFeature, BatchFeature]:
         inputs = {k: v for k, v in inputs.items() if not k.startswith("__debug_")}
+        #target_dtype = torch.float16 if getattr(self, "use_bf16", False) else torch.float32
         self.validate_inputs(inputs)
         backbone_inputs = self.backbone.prepare_input(inputs)
         action_inputs = self.action_head.prepare_input(inputs)
@@ -192,6 +193,13 @@ class GR00T_N1_5(PreTrainedModel):
             else:
                 # Keep original dtype
                 return x.to(self.device)
+
+            # if not isinstance(x, torch.Tensor):
+            #     return x  # int/str/None/リスト等はそのまま
+            # # テンソルのみ dtype 調整
+            # if torch.is_floating_point(x):
+            #     x = x.to(dtype=target_dtype)
+            # return x.to(device)
 
         backbone_inputs = tree.map_structure(to_device_with_maybe_dtype, backbone_inputs)
         action_inputs = tree.map_structure(to_device_with_maybe_dtype, action_inputs)

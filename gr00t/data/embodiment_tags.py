@@ -37,6 +37,12 @@ class EmbodimentTag(Enum):
     Any new embodiment for finetuning.
     """
 
+    GOOGLE_ROBOT = "google_robot"
+    """
+    The Google Robot dataset.
+    """
+    WIDOWX = "widowx"
+
 
 # Embodiment tag string: to projector index in the Action Expert Module
 EMBODIMENT_TAG_MAPPING = {
@@ -44,4 +50,6 @@ EMBODIMENT_TAG_MAPPING = {
     EmbodimentTag.OXE_DROID.value: 17,
     EmbodimentTag.AGIBOT_GENIE1.value: 26,
     EmbodimentTag.GR1.value: 24,
+    EmbodimentTag.GOOGLE_ROBOT.value: 13,
+    EmbodimentTag.WIDOWX.value: 14,
 }

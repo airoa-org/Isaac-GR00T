@@ -128,3 +128,8 @@ ckpt*
 debug_*/
 subset_dataset*
 *.npz
+
+data/
+input/
+my_outputs/
+
