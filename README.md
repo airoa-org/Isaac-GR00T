@@ -365,3 +365,32 @@ For more details, see [CONTRIBUTING.md](CONTRIBUTING.md)
 # See the License for the specific language governing permissions and
 # limitations under the License.
 ```
+
+
+# inference in Deploy
+
+```
+cd /path/to/Issac-GR00T
+conda create -n gr00t python=3.10
+conda activate gr00t
+conda install -c conda-forge git-lfs
+conda install conda-forge::libdav1d7
+conda install bahaelaila7::libaom
+
+pip install --upgrade setuptools
+pip install -e .[base]
+pip install --no-build-isolation flash-attn==2.7.1.post4 
+
+```
+hsr_gr00t_lcm_tempensem.pyを直接編集し、推論対象のモデルを指定します。
+
+```
+vim deploy/hsr_gr00t_deploy/scripts/hsr_gr00t_lcm_tempensem.py
+# 306行目付近を編集
+# checkpoint_dir = "/path/to/hsr_checkpoint"
+```
+推論ノードを実行します。
+```
+python deploy/hsr_gr00t_deploy/scripts/hsr_gr00t_lcm_tempensem.py
+```
+`start server...`が出たら準備完了です。

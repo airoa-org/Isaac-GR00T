@@ -305,7 +305,7 @@ def main():
     # TODO: 引数でいい感じに処理するようにする
     checkpoint_dir = "/home/veluga-g3/airoa/ckpt/gr00t-050607"
     adopted_action_chunks = 32
-    use_temp_ensem = True
+    use_temp_ensem = False
 
     print(f"checkpoint_dir: {checkpoint_dir}")
     print(f"adopted_action_chunks: {adopted_action_chunks}")
