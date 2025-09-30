@@ -146,8 +146,8 @@ class Gr00tHSRPolicy:
         }
         #self.reset_buffer()
 
-        replay_episode = np.load("/home/veluga-g3/Downloads/episode_1511_action_relative.npz", allow_pickle=False)
-        self.actions_rel = replay_episode["actions"]
+        #replay_episode = np.load("/home/veluga-g3/Downloads/episode_1511_action_relative.npz", allow_pickle=False)
+        #self.actions_rel = replay_episode["actions"]
         self.frame_num = 0
 
         self.use_temp_ensem = use_temp_ensem          # 無効にしたい時は False
@@ -271,7 +271,7 @@ class Gr00tHSRPolicy:
             exp_weights = torch.from_numpy(exp_weights).cuda().unsqueeze(dim=1)
             raw_action = (actions_for_curr_step * exp_weights).sum(dim=0, keepdim=True)
             #raw_action[5] = 1.2
-            print(raw_action)
+            #print(raw_action)
             self.t += 1
 
             return raw_action
