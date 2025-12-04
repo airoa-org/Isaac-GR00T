@@ -18,6 +18,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+import wandb
 from typing import List, Literal
 
 import torch
@@ -32,6 +33,16 @@ from gr00t.model.gr00t_n1 import GR00T_N1_5
 from gr00t.model.transforms import EMBODIMENT_TAG_MAPPING
 from gr00t.utils.peft import get_lora_model
 
+torch.backends.cuda.enable_flash_sdp(True)
+torch.backends.cuda.enable_mem_efficient_sdp(True)
+torch.backends.cuda.enable_math_sdp(False)
+
+
+
+wandb.init(
+    project="pg-vla",
+    entity="k-makihara"
+)
 
 @dataclass
 class ArgsConfig:
@@ -64,7 +75,7 @@ class ArgsConfig:
     base_model_path: str = "nvidia/GR00T-N1.5-3B"
     """Path or HuggingFace model ID for the base model."""
 
-    tune_llm: bool = False
+    tune_llm: bool = True
     """Whether to fine-tune the language model backbone."""
 
     tune_visual: bool = False
@@ -101,7 +112,7 @@ class ArgsConfig:
     lora_full_model: bool = False
     """Whether to use the full model for LORA. If False, only the action head will be trained."""
 
-    dataloader_num_workers: int = 8
+    dataloader_num_workers: int = 32
     """Number of workers for data loading."""
 
     report_to: Literal["wandb", "tensorboard", "azure_ml"] = "wandb"
@@ -136,6 +147,8 @@ def main(config: ArgsConfig):
     # 1.1 modality configs and transforms
     data_config_cls = DATA_CONFIG_MAP[config.data_config]
     modality_configs = data_config_cls.modality_config()
+    #print(modality_configs)
+    #{'video': ModalityConfig(delta_indices=[0], modality_keys=['video.front_rgb', 'video.hand_rgb']), 'state': ModalityConfig(delta_indices=[0], modality_keys=['state.arm', 'state.gripper']), 'action': ModalityConfig(delta_indices=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15], modality_keys=['action.arm', 'action.gripper']), 'language': ModalityConfig(delta_indices=[0], modality_keys=['annotation.human.action.task_description'])}
     transforms = data_config_cls.transform()
 
     # 1.2 data loader: we will use either single dataset or mixture dataset
@@ -229,6 +242,17 @@ def main(config: ArgsConfig):
     model.compute_dtype = "bfloat16"
     model.config.compute_dtype = "bfloat16"
 
+    torch._dynamo.config.suppress_errors = True
+    torch._dynamo.config.automatic_dynamic_shapes = True
+    torch._inductor.config.triton.cudagraphs = False
+
+    # PyTorch 2.3+ なら compile(dynamic=True) を使う
+    # model = torch.compile(model,
+    #                     backend="inductor",
+    #                     mode="max-autotune",
+    #                     fullgraph=False,
+    #                     dynamic=True)
+
     if config.lora_rank > 0:
         model = get_lora_model(
             model,
@@ -248,7 +272,7 @@ def main(config: ArgsConfig):
         bf16=True,
         tf32=True,
         per_device_train_batch_size=config.batch_size,
-        gradient_accumulation_steps=1,
+        gradient_accumulation_steps=4,
         dataloader_num_workers=config.dataloader_num_workers,
         dataloader_pin_memory=False,
         dataloader_persistent_workers=config.dataloader_num_workers > 0,
@@ -260,19 +284,22 @@ def main(config: ArgsConfig):
         weight_decay=config.weight_decay,
         warmup_ratio=config.warmup_ratio,
         lr_scheduler_type="cosine",
-        logging_steps=10.0,
+        logging_steps=50,
         num_train_epochs=300,
         max_steps=config.max_steps,
         save_strategy="steps",
         save_steps=config.save_steps,
         # evaluation_strategy="no",
-        save_total_limit=8,
+        save_total_limit=5,
         report_to=config.report_to,
         seed=42,
         do_eval=False,
         ddp_find_unused_parameters=False,
         ddp_bucket_cap_mb=100,
         torch_compile_mode=None,
+        #torch_compile=False,
+        #torch_compile_backend="inductor",          # 既定。明示しておく
+        #torch_compile_mode="max-autotune",
     )
 
     # 2.2 run experiment

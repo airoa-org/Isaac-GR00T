@@ -47,6 +47,7 @@ def calc_mse_for_single_trajectory(
     state_joints_across_time = []
     gt_action_across_time = []
     pred_action_across_time = []
+    reasoning_across_time = []
 
     for step_count in range(steps):
         data_point = dataset.get_step_data(traj_id, step_count)
@@ -68,7 +69,7 @@ def calc_mse_for_single_trajectory(
 
         if step_count % action_horizon == 0:
             print("inferencing at step: ", step_count)
-            action_chunk = policy.get_action(data_point)
+            action_chunk, reasoning = policy.get_action(data_point)
             for j in range(action_horizon):
                 # NOTE: concat_pred_action = action[f"action.{modality_keys[0]}"][j]
                 # the np.atleast_1d is to ensure the action is a 1D array, handle where single value is returned
@@ -77,6 +78,8 @@ def calc_mse_for_single_trajectory(
                     axis=0,
                 )
                 pred_action_across_time.append(concat_pred_action)
+            reasoning_across_time.append(reasoning)
+            print(reasoning)
 
     # plot the joints
     state_joints_across_time = np.array(state_joints_across_time)
@@ -91,6 +94,7 @@ def calc_mse_for_single_trajectory(
     print("state_joints vs time", state_joints_across_time.shape)
     print("gt_action_joints vs time", gt_action_across_time.shape)
     print("pred_action_joints vs time", pred_action_across_time.shape)
+    print(reasoning_across_time)
 
     # raise error when pred action has NaN
     if np.isnan(pred_action_across_time).any():

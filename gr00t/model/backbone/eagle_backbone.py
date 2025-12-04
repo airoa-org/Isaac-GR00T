@@ -62,6 +62,8 @@ class EagleBackbone(nn.Module):
         self.select_layer = select_layer
         self.set_trainable_parameters(tune_llm, tune_visual)
 
+        self.pattern = torch.tensor([151644, 77091, 198], device='cuda:0', dtype=torch.int64)
+
     def set_trainable_parameters(self, tune_llm: bool, tune_visual: bool):
         self.tune_llm = tune_llm
         self.tune_visual = tune_visual
@@ -97,6 +99,99 @@ class EagleBackbone(nn.Module):
     def prepare_input(self, batch: dict) -> BatchFeature:
         return BatchFeature(data=batch)
 
+    def split_dict_by_pattern_inclusive_cuda(self, batch_dict, pattern):
+        assert "input_ids" in batch_dict, "batch_dictに'input_ids'キーが必要です"
+        x = batch_dict["input_ids"][0]  # shape: (N,)
+        device = x.device
+        pattern = pattern.to(device)
+
+        N, M = x.shape[0], pattern.shape[0]
+        if N < M:
+            return batch_dict, None
+
+        windows = x.unfold(0, M, 1)  # shape (N-M+1, M)
+        matches = (windows == pattern).all(dim=1)
+        idx = torch.nonzero(matches, as_tuple=False)
+
+        if idx.numel() == 0:
+            return batch_dict, None
+
+        split_idx = idx[0].item() + M  
+
+        a_dict, b_dict = {}, {}
+        for key, val in batch_dict.items():
+            a_dict[key] = val[:, :split_idx]
+            b_dict[key] = val[:, split_idx:]
+        return a_dict, b_dict
+
+    def add_labels_masking_a_region(self, batch_dict, pattern, value):
+        input_ids = batch_dict['input_ids']              # [B, T]
+        device = input_ids.device
+        pattern = pattern.to(device)
+        B, T = input_ids.shape
+        M = pattern.shape[0]
+
+        labels = input_ids.clone()
+
+        for b in range(B):
+            x = input_ids[b]
+            # --- パターン検索 ---
+            if T < M:
+                continue  # 長さがパターンより短い場合はスキップ
+
+            # x.unfold(0, M, 1) -> [T - M + 1, M]
+            windows = x.unfold(0, M, 1)
+            matches = (windows == pattern).all(dim=1)  # [T - M + 1]
+            idx = torch.nonzero(matches, as_tuple=False)
+
+            # --- 該当範囲をマスク ---
+            if idx.numel() > 0:
+                split_idx = idx[0].item() + M  # パターン直後の位置
+                labels[b, :split_idx] = value   # 例：-100でマスク
+
+        # --- 新しい辞書返却 ---
+        new_dict = {k: v for k, v in batch_dict.items()}
+        new_dict['labels'] = labels
+        return new_dict
+
+    def remove_labels(self, batch_dict, pattern):
+        input_ids = batch_dict["input_ids"]          # [B, T]
+        device = input_ids.device
+        pattern_ids = pattern.to(device)
+        B, T = input_ids.shape
+        M = pattern_ids.numel()
+
+        if "attention_mask" in batch_dict:
+            attn = batch_dict["attention_mask"]
+        else:
+            attn = torch.ones_like(input_ids, dtype=torch.long)
+
+        new_input_ids_list = []
+        new_attn_list = []
+        split_idx_list = [None] * B
+
+        for b in range(B):
+            x = input_ids[b]        # [T]
+            a = attn[b]             # [T]
+
+            end = T  # デフォルト：見つからなければ全体を残す
+            if T >= M:
+                wins = x.unfold(0, M, 1)                 # [T-M+1, M]
+                m = (wins == pattern_ids).all(dim=1)     # [T-M+1]
+                idx = torch.nonzero(m, as_tuple=False)
+                if idx.numel() > 0:
+                    end = idx[0].item() + M              # パターン直後の位置
+                    split_idx_list[b] = end
+
+            new_input_ids_list.append(x[:end].clone())
+            new_attn_list.append(a[:end].clone())
+
+        new_dict = dict(batch_dict)  # shallow copy
+        new_dict["input_ids"] = new_input_ids_list
+        new_dict["attention_mask"] = new_attn_list
+        return new_dict, split_idx_list
+
+
     def forward_eagle(self, vl_input: BatchFeature) -> BatchFeature:
         eagle_prefix = "eagle_"
         eagle_input = {
@@ -104,21 +199,87 @@ class EagleBackbone(nn.Module):
             for k, v in vl_input.items()
             if k.startswith(eagle_prefix)
         }
+        #print(eagle_input)
+        #for k, v in eagle_input.items():
+        #    print(k, v.shape if torch.is_tensor(v) else type(v))
         del eagle_input["image_sizes"]
+        #a_dict, b_dict = self.split_dict_by_pattern_inclusive_cuda(eagle_input, self.pattern)
+        #eagle_input["input_ids"] = a_dict["input_ids"]
+        #eagle_input["attention_mask"] = a_dict["attention_mask"]
+        #print(b_dict)
+        # target_ids = b_dict.get("input_ids", None)
+        # if target_ids is not None:
+        #     eagle_input["labels"] = target_ids
+        # print(eagle_input)
+        value = -100
 
-        eagle_output = self.eagle_model(**eagle_input, output_hidden_states=True, return_dict=True)
-        eagle_features = eagle_output.hidden_states[self.select_layer]
+        #for k, v in eagle_input.items():
+        #    print(k, v.shape if torch.is_tensor(v) else type(v))
+        #eagle_input = self.add_labels_masking_a_region(eagle_input, self.pattern, value)
+        #print(eagle_input)
+        if self.training and self.tune_llm:
+            eagle_input = self.add_labels_masking_a_region(eagle_input, self.pattern, value)
+        #else:
+        #    eagle_input, split_idx_list = self.remove_labels(eagle_input, self.pattern)
+        #print(eagle_input)
+
+        #print(eagle_input)
+        #print("-----------------")
+        #for k, v in eagle_input.items():
+        #    print(k, v.shape if torch.is_tensor(v) else type(v))
+        if self.training:
+            eagle_output = self.eagle_model(**eagle_input, output_hidden_states=True, return_dict=True)
+            eagle_features = eagle_output.hidden_states[self.select_layer]
+        else:
+            #eagle_output_org = self.eagle_model(**eagle_input, output_hidden_states=True, return_dict=True)
+            eagle_output = self.eagle_model.generate(
+                pixel_values=eagle_input["pixel_values"],
+                input_ids=eagle_input["input_ids"],
+                attention_mask=eagle_input["attention_mask"],
+                max_new_tokens=64,                 # ← 系列長コントロール
+                do_sample=False,                   # greedy
+                temperature=1.0,
+                top_p=1.0,
+                #visual_features: Optional[torch.FloatTensor] = eagle_input[]
+                #generation_config: Optional[GenerationConfig] = None,
+                output_hidden_states=True,
+                return_dict_in_generate=True)
+            eagle_features = eagle_output.hidden_states[-1][self.select_layer]
 
         eagle_features = self.eagle_linear(eagle_features)
-        return eagle_features, eagle_input["attention_mask"]
+        if self.training and self.tune_llm:
+            pred_ids = eagle_output_org.logits.argmax(dim=-1)              
+            target_mask = (eagle_input['labels'] != value)                       
+            pred_target_ids = [pred_ids[b][target_mask[b]] for b in range(pred_ids.size(0))]
+        else:
+            #print(eagle_input["input_ids"])
+            lengths = eagle_input["attention_mask"].sum(dim=1)     # [B]
+            #last_idx = lengths - 1
+            #pred_ids = eagle_output.logits.argmax(dim=-1) 
+            #print(pred_ids)
+            B = eagle_input["input_ids"].size(0)
+            #next_logits = eagle_output.logits[torch.arange(B, device=eagle_output.logits.device), last_idx]  # [B,V]
+            #next_ids = next_logits.argmax(dim=-1, keepdim=True)
+            #print(next_ids)
+            
+            new_texts = []
+            for b in range(B):
+                gen_part = eagle_output[b, :]
+                new_texts.append(gen_part)
+            #print(new_texts[0])
+            # 3) ターゲット部分だけ抜き出し→デコード（あなたの採用方法そのまま）
+            pred_target_ids = [new_texts[0]]
+        
+        return eagle_features, eagle_input["attention_mask"], eagle_output_org, pred_target_ids
 
     def forward(self, vl_input: BatchFeature) -> BatchFeature:
         self.set_frozen_modules_to_eval_mode()
 
-        eagle_embeds, eagle_mask = self.forward_eagle(vl_input)
+        eagle_embeds, eagle_mask, eagle_output, pred_target_ids = self.forward_eagle(vl_input)
 
         # YL (TODO HACK): to resolve DDP issue when tune_visual=True
         # Ensure all trainable parameters in vision_model are used in the forward pass for DDP compatibility
+        language_loss = None
         if self.training and self.tune_visual:
             dummy_term = torch.tensor(
                 0.0, device=eagle_embeds.device, dtype=eagle_embeds.dtype, requires_grad=True
@@ -127,7 +288,25 @@ class EagleBackbone(nn.Module):
                 if param.requires_grad:
                     dummy_term = dummy_term + 0.0 * param.sum()
             eagle_embeds = eagle_embeds + dummy_term
+            
+        if self.training and self.tune_llm:
+            if hasattr(eagle_output, "loss"):
+                language_loss = eagle_output.loss
+            elif target_ids is not None and hasattr(eagle_output, "logits"):
+                # AutoModelの場合: 手動でCrossEntropy計算
+                logits = eagle_output.logits
+                shift_logits = logits[..., :-1, :].contiguous()
+                shift_labels = target_ids[..., 1:].contiguous()
+                language_loss = F.cross_entropy(
+                    shift_logits.view(-1, shift_logits.size(-1)),
+                    shift_labels.view(-1),
+                    ignore_index=self.eagle_model.config.pad_token_id,
+                )
+        #eagle_embeds2 = eagle_embeds.detach()
 
+        #return BatchFeature(
+        #    data={"backbone_features": eagle_embeds2, "backbone_attention_mask": eagle_mask, "backbone_lastfeature": eagle_output, "pred_target_ids": pred_target_ids, "language_loss": language_loss}
+        #)  # [B, T2, hidden_size]
         return BatchFeature(
-            data={"backbone_features": eagle_embeds, "backbone_attention_mask": eagle_mask}
+            data={"backbone_features": eagle_embeds, "backbone_attention_mask": eagle_mask, "backbone_lastfeature": eagle_output, "pred_target_ids": pred_target_ids, "language_loss": language_loss}
         )  # [B, T2, hidden_size]

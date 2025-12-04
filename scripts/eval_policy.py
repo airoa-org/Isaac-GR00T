@@ -52,7 +52,7 @@ class ArgsConfig:
     plot: bool = False
     """Whether to plot the images."""
 
-    modality_keys: List[str] = field(default_factory=lambda: ["right_arm", "left_arm"])
+    modality_keys: List[str] = field(default_factory=lambda: ["arm", "gripper"])
     """Modality keys to evaluate."""
 
     data_config: Literal[tuple(DATA_CONFIG_MAP.keys())] = "fourier_gr1_arms_only"
@@ -67,7 +67,7 @@ class ArgsConfig:
     action_horizon: int = None
     """Action horizon to evaluate. If None, will use the data config's action horizon."""
 
-    video_backend: Literal["decord", "torchvision_av"] = "decord"
+    video_backend: Literal["decord", "torchvision_av"] = "torchvision_av"
     """Video backend to use for various codec options. h264: decord or av: torchvision_av"""
 
     dataset_path: str = "demo_data/robot_sim.PickNPlace/"
@@ -82,7 +82,7 @@ class ArgsConfig:
     denoising_steps: int = 4
     """Number of denoising steps to use."""
 
-    save_plot_path: str = None
+    save_plot_path: str = "test.png"
     """Path to save the plot."""
 
 

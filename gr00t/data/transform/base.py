@@ -125,6 +125,9 @@ class ComposedModalityTransform(ModalityTransform):
                     raise ValueError(f"Error unapplying transform {step} to data: {e}") from e
         return data
 
+    def unapply_reasoning(self, data):
+        return data
+
     def train(self):
         for transform in self.transforms:
             transform.train()

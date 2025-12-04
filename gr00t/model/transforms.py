@@ -49,10 +49,56 @@ def build_eagle_processor(eagle_path: str) -> ProcessorMixin:
         eagle_path, trust_remote_code=True, use_fast=True
     )
     eagle_processor.tokenizer.padding_side = "left"
+    
+    eagle_processor.model_max_length = 64
+    eagle_processor.tokenizer.truncation_side = "right"
+    eagle_processor.tokenizer.pad_token = eagle_processor.tokenizer.eos_token
     return eagle_processor
 
+# def build_eagle_processor(eagle_path: str) -> ProcessorMixin:
+#     p = AutoProcessor.from_pretrained(eagle_path, trust_remote_code=True, use_fast=True)
+#     p.tokenizer.padding_side = "left"
 
-def collate(features: List[dict], eagle_processor) -> dict:
+#     # 追加：常に max_length で詰める
+#     # 適切な長さを設定（例：512）。モデルに合わせて。
+#     p.tokenizer.model_max_length = 32
+#     p.tokenizer.truncation_side = "right"
+#     p.tokenizer.pad_token = p.tokenizer.eos_token
+#     p.feature_extractor.padding = "max_length" if hasattr(p, "feature_extractor") else None
+#     return p
+
+def _pin_if_cpu_tensor(x):
+    # CPU テンソルは pinned に。GPU テンソル/非テンソルはそのまま返す
+    if isinstance(x, torch.Tensor) and x.device.type == "cpu":
+        try:
+            return x.pin_memory()
+        except RuntimeError:
+            return x
+    return x
+
+def _to_np_float32(x):
+    # torch.Tensor → CPU float32 numpy
+    if isinstance(x, torch.Tensor):
+        # dataloader worker 内なら大抵 CPU tensor のはずだが、念のため detach+cpu
+        x = x.detach().cpu().to(torch.float32)
+        return x.numpy()
+    # numpy / list → numpy float32
+    arr = np.asarray(x)
+    if arr.dtype != np.float32:
+        arr = arr.astype(np.float32, copy=False)
+    return arr
+
+def _to_np_bool(x):
+    if isinstance(x, torch.Tensor):
+        x = x.detach().cpu().to(torch.bool)
+        return x.numpy()
+    arr = np.asarray(x)
+    if arr.dtype != np.bool_:
+        arr = arr.astype(np.bool_, copy=False)
+    return arr
+
+
+def collate(features: List[dict], eagle_processor, training) -> dict:
     batch = {}
     keys = features[0].keys()
 
@@ -61,27 +107,63 @@ def collate(features: List[dict], eagle_processor) -> dict:
 
         if key == "eagle_content":
             text_list = []
+            if training:
+                text_list_out = []
+            else:
+                text_list_out = None
             image_inputs = []
             for v in values:
                 curr_text_list = v["text_list"]
+                if training:
+                    curr_text_list_out = v["text_list_out"]
                 curr_image_inputs = v["image_inputs"]
                 text_list += curr_text_list
+                if training:
+                    text_list_out += curr_text_list_out
                 image_inputs += curr_image_inputs
+            
+            #print(text_list)
+            #print(text_list_out)
             eagle_inputs = eagle_processor(
-                text=text_list, images=image_inputs, return_tensors="pt", padding=True
+                text=text_list, target_text=text_list_out, images=image_inputs, return_tensors="pt", padding=True
             )
+            # eagle_inputs = eagle_processor(
+            #     text=text_list,
+            #     images=image_inputs,
+            #     return_tensors="pt",
+            #     padding="max_length",     # ← ここを True ではなく "max_length"
+            #     truncation=True,          # ← 端数が来ても切る
+            #     max_length=eagle_processor.tokenizer.model_max_length,
+            # )
             for k, v in eagle_inputs.items():
                 k = "eagle_" + k
                 batch[k] = v
+                #batch[k] = _pin_if_cpu_tensor(v)
         elif key in ("pixel_values", "image_grid_thw", "attention_mask", "input_ids"):
             # Concat in existing batch dimension.
             batch[key] = torch.cat(values)
+            #batch[key] = _pin_if_cpu_tensor(torch.cat(values))
         else:
             # state, state_mask, action and action_mask.
             # Stack to form the batch dimension.
             batch[key] = torch.from_numpy(np.stack(values))
-    return batch
+            #batch[key] = _pin_if_cpu_tensor(torch.from_numpy(np.stack(values)))
+            # arr = np.stack(values)
 
+            # # dtype 正規化：float64 禁止、float32 に揃える
+            # if arr.dtype == np.float64:
+            #     arr = arr.astype(np.float32, copy=False)
+
+            # # mask らしきものは bool を強制
+            # if key.endswith("_mask") and arr.dtype != np.bool_:
+            #     arr = arr.astype(np.bool_, copy=False)
+
+            # # そのほかの数値は float32 / int 系はそのまま
+            # t = torch.from_numpy(arr)
+            # batch[key] = _pin_if_cpu_tensor(t)
+
+    return batch
+    #return tree.map_structure(_pin_if_cpu_tensor, batch)
 
 class DefaultDataCollator(DataCollatorMixin):
     def __init__(self, eagle_path: str = DEFAULT_EAGLE_PATH):
@@ -89,7 +171,7 @@ class DefaultDataCollator(DataCollatorMixin):
         self.eagle_processor = build_eagle_processor(eagle_path)
 
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
-        return collate(features, self.eagle_processor)
+        return collate(features, self.eagle_processor, True)
 
 
 class GR00TTransform(InvertibleModalityTransform):
@@ -118,6 +200,7 @@ class GR00TTransform(InvertibleModalityTransform):
 
     # XEmbDiT arguments
     default_instruction: str = Field(default="Perform the default behavior.")
+    default_reasoning: str = Field(default="The behavior is performing well.")
     max_state_dim: int
     max_action_dim: int
     state_horizon: int
@@ -125,6 +208,7 @@ class GR00TTransform(InvertibleModalityTransform):
 
     max_length: int = 512
     embodiment_tag: EmbodimentTag | None = None
+
 
     def set_metadata(self, dataset_metadata: DatasetMetadata):
         """Set the metadata for the transform."""
@@ -164,9 +248,10 @@ class GR00TTransform(InvertibleModalityTransform):
 
         # Handle language
         if "language" in grouped_keys:
-            language_keys = grouped_keys["language"]
-            assert len(language_keys) == 1, f"{language_keys=}"
-            self._language_key = language_keys[0]
+            #language_keys = grouped_keys["language"]
+            language_keys = ["annotation.human.action.task_description", "annotation.reason.physical_property"]
+            assert len(language_keys) == 2, f"{language_keys=}"
+            self._language_key = language_keys
         return is_batched, batch_size
 
     def _apply_vlm_processing(self, batch: dict) -> BatchFeature:
@@ -189,6 +274,14 @@ class GR00TTransform(InvertibleModalityTransform):
             lang = lang[0]
         text_content.append({"type": "text", "text": lang})
 
+        text_content_out = []
+
+        # handle language
+        lang_out = batch["language_out"]
+        if isinstance(lang_out, list):
+            lang_out = lang_out[0]
+        text_content_out.append({"type": "text", "text": lang_out})
+
         eagle_images = [Image.fromarray(np.transpose(v, (1, 2, 0))) for v in np_images]
         eagle_image = [{"type": "image", "image": img} for img in eagle_images]
         eagle_conversation = [
@@ -203,11 +296,13 @@ class GR00TTransform(InvertibleModalityTransform):
                 eagle_conversation, tokenize=False, add_generation_prompt=True
             )
         ]
+        lang_out += "<|im_end|>\n"
         image_inputs, video_inputs = self.eagle_processor.process_vision_info(eagle_conversation)
         eagle_content = {
             "image_inputs": image_inputs,
             "video_inputs": video_inputs,
             "text_list": text_list,
+            "text_list_out": [lang_out],
         }
         inputs = {}
         inputs["eagle_content"] = eagle_content
@@ -225,99 +320,202 @@ class GR00TTransform(InvertibleModalityTransform):
     def _prepare_language(self, data: dict):
         """Tokenize data['language'] (or default_instruction if missing)."""
         if self._language_key is not None:
-            raw_language = data[self._language_key]
+            raw_language = data[self._language_key[0]]
+            raw_language_out = self.default_reasoning
+            if self.training:
+                raw_language_out = data[self._language_key[1]]
             if isinstance(raw_language, list):
                 raw_language = raw_language[0]
+            if self.training:
+                if isinstance(raw_language_out, list):
+                    raw_language_out = raw_language_out[0]
 
             # Language dropout
             if self.training and self.language_dropout_prob > 1e-9:
                 if random.random() < self.language_dropout_prob:
                     raw_language = self.default_instruction
+
+                if random.random() < self.language_dropout_prob:
+                    raw_language_out = self.default_reasoning
+
+            
+
         else:
             raw_language = self.default_instruction
-        return raw_language
+            raw_language_out = self.default_reasoning
+        return raw_language, raw_language_out
+
+    # def _prepare_state(self, data: dict):
+    #     """
+    #     Gathers final state from data['state'], then pads to max_state_dim.
+    #     Return (state, state_mask, n_state_tokens).
+    #     """
+    #     if "state" not in data:
+    #         state = np.zeros((self.state_horizon, self.max_state_dim))
+    #         state_mask = np.zeros((self.state_horizon, self.max_state_dim), dtype=bool)
+    #         n_state_tokens = self.state_horizon
+    #         return state, state_mask, n_state_tokens
+
+    #     state = data["state"]
+    #     assert state.shape[0] == self.state_horizon, f"{state.shape=}, {self.state_horizon=}"
+
+    #     n_state_dims = state.shape[-1]
+
+    #     # Instead of asserting, just take the first max_state_dim dimensions if needed
+    #     if n_state_dims > self.max_state_dim:
+    #         state = state[:, : self.max_state_dim]
+    #         n_state_dims = self.max_state_dim
+    #     else:
+    #         # Pad up to max_state_dim if smaller
+    #         state = np.pad(state, ((0, 0), (0, self.max_state_dim - n_state_dims)), "constant")
+
+    #     # Create mask for real state dims
+    #     state_mask = np.zeros_like(state).astype(bool)
+    #     state_mask[:, :n_state_dims] = True
+
+    #     # We only have 1 "proprio" token to represent the entire state
+    #     n_state_tokens = state.shape[0]
+    #     return state, state_mask, n_state_tokens
 
     def _prepare_state(self, data: dict):
-        """
-        Gathers final state from data['state'], then pads to max_state_dim.
-        Return (state, state_mask, n_state_tokens).
-        """
         if "state" not in data:
-            state = np.zeros((self.state_horizon, self.max_state_dim))
+            state = np.zeros((self.state_horizon, self.max_state_dim), dtype=np.float32)
             state_mask = np.zeros((self.state_horizon, self.max_state_dim), dtype=bool)
             n_state_tokens = self.state_horizon
             return state, state_mask, n_state_tokens
 
-        state = data["state"]
+        state = _to_np_float32(data["state"])
         assert state.shape[0] == self.state_horizon, f"{state.shape=}, {self.state_horizon=}"
 
         n_state_dims = state.shape[-1]
-
-        # Instead of asserting, just take the first max_state_dim dimensions if needed
         if n_state_dims > self.max_state_dim:
             state = state[:, : self.max_state_dim]
             n_state_dims = self.max_state_dim
         else:
-            # Pad up to max_state_dim if smaller
+            # pad を入れても dtype は float32 のまま
             state = np.pad(state, ((0, 0), (0, self.max_state_dim - n_state_dims)), "constant")
 
-        # Create mask for real state dims
-        state_mask = np.zeros_like(state).astype(bool)
+        state_mask = np.zeros_like(state, dtype=bool)
         state_mask[:, :n_state_dims] = True
 
-        # We only have 1 "proprio" token to represent the entire state
         n_state_tokens = state.shape[0]
         return state, state_mask, n_state_tokens
 
+
+
+    # def _prepare_action(self, data: dict):
+    #     """
+    #     Pad to max_action_dim, return masks.
+    #     """
+    #     if "action" not in data:
+    #         actions = np.zeros((self.action_horizon, self.max_action_dim))
+    #         actions_mask = np.zeros((self.action_horizon, self.max_action_dim), dtype=bool)
+    #         n_action_tokens = self.action_horizon
+    #         return actions, actions_mask, n_action_tokens
+
+    #     actions = data["action"]
+    #     assert actions.shape[0] == self.action_horizon, f"{actions.shape=}, {self.action_horizon=}"
+
+    #     n_action_tokens = actions.shape[0]  # T
+    #     n_action_dims = actions.shape[1]
+
+    #     assert (
+    #         n_action_dims <= self.max_action_dim
+    #     ), f"Action dim {n_action_dims} exceeds max allowed {self.max_action_dim}."
+
+    #     # Pad the channel dimension
+    #     actions = np.pad(actions, ((0, 0), (0, self.max_action_dim - n_action_dims)), "constant")
+
+    #     # Create mask: [T, max_action_dim]
+    #     actions_mask = np.zeros((n_action_tokens, self.max_action_dim), dtype=bool)
+    #     actions_mask[:, :n_action_dims] = True
+
+    #     return actions, actions_mask, n_action_tokens
+    
     def _prepare_action(self, data: dict):
-        """
-        Pad to max_action_dim, return masks.
-        """
         if "action" not in data:
-            actions = np.zeros((self.action_horizon, self.max_action_dim))
+            actions = np.zeros((self.action_horizon, self.max_action_dim), dtype=np.float32)
             actions_mask = np.zeros((self.action_horizon, self.max_action_dim), dtype=bool)
             n_action_tokens = self.action_horizon
             return actions, actions_mask, n_action_tokens
 
-        actions = data["action"]
+        actions = _to_np_float32(data["action"])
         assert actions.shape[0] == self.action_horizon, f"{actions.shape=}, {self.action_horizon=}"
 
-        n_action_tokens = actions.shape[0]  # T
+        n_action_tokens = actions.shape[0]
         n_action_dims = actions.shape[1]
+        assert n_action_dims <= self.max_action_dim, \
+            f"Action dim {n_action_dims} exceeds max allowed {self.max_action_dim}."
 
-        assert (
-            n_action_dims <= self.max_action_dim
-        ), f"Action dim {n_action_dims} exceeds max allowed {self.max_action_dim}."
-
-        # Pad the channel dimension
         actions = np.pad(actions, ((0, 0), (0, self.max_action_dim - n_action_dims)), "constant")
-
-        # Create mask: [T, max_action_dim]
         actions_mask = np.zeros((n_action_tokens, self.max_action_dim), dtype=bool)
         actions_mask[:, :n_action_dims] = True
 
         return actions, actions_mask, n_action_tokens
 
+
+
+    # def apply_single(self, data: dict) -> dict:
+    #     transformed_data = {}
+
+    #     # 1) Prepare video and language with vlm processing.
+    #     images = self._prepare_video(data)
+    #     images = images.astype(np.uint8)
+    #     language = self._prepare_language(data)
+    #     batch_data = {"images": images, "language": language}
+    #     vlm_outputs = self._apply_vlm_processing(batch_data)
+
+    #     # 2) Prepare state
+    #     state, state_mask, _ = self._prepare_state(data)
+    #     transformed_data["state"] = state
+    #     transformed_data["state_mask"] = state_mask
+
+    #     if self.training:
+    #         # 3) Prepare actions
+    #         transformed_data["segmentation_target"] = np.zeros((2,))
+    #         transformed_data["segmentation_target_mask"] = np.zeros((1,))
+    #         transformed_data["has_real_action"] = np.ones((), dtype=bool)
+    #         actions, actions_mask, _ = self._prepare_action(data)
+    #         transformed_data["action"] = actions
+    #         transformed_data["action_mask"] = actions_mask
+
+    #     for k, v in vlm_outputs.items():
+    #         assert k not in transformed_data, f"Key {k} already exists in transformed_data."
+    #         transformed_data[k] = v
+
+    #     transformed_data["embodiment_id"] = self.get_embodiment_tag()
+
+    #     if self.training:
+    #         action_and_mask_keys = ["action", "action_mask"]
+    #         assert all(
+    #             transformed_data[key].shape == transformed_data["action"].shape
+    #             for key in action_and_mask_keys
+    #         ), f"Shape mismatch: {[(key, transformed_data[key].shape) for key in action_and_mask_keys]}"
+
+    #     return transformed_data
+
     def apply_single(self, data: dict) -> dict:
         transformed_data = {}
 
-        # 1) Prepare video and language with vlm processing.
+        # video はそのまま
         images = self._prepare_video(data)
         images = images.astype(np.uint8)
-        language = self._prepare_language(data)
-        batch_data = {"images": images, "language": language}
+
+        language, language_out = self._prepare_language(data)
+        batch_data = {"images": images, "language": language, "language_out": language_out}
         vlm_outputs = self._apply_vlm_processing(batch_data)
 
-        # 2) Prepare state
+        # state
         state, state_mask, _ = self._prepare_state(data)
         transformed_data["state"] = state
         transformed_data["state_mask"] = state_mask
 
         if self.training:
-            # 3) Prepare actions
-            transformed_data["segmentation_target"] = np.zeros((2,))
-            transformed_data["segmentation_target_mask"] = np.zeros((1,))
+            # --- ここ dtype 明示（NEW） ---
+            transformed_data["segmentation_target"] = np.zeros((2,), dtype=np.float32)
+            transformed_data["segmentation_target_mask"] = np.zeros((1,), dtype=bool)
             transformed_data["has_real_action"] = np.ones((), dtype=bool)
+            # --------------------------------
             actions, actions_mask, _ = self._prepare_action(data)
             transformed_data["action"] = actions
             transformed_data["action_mask"] = actions_mask
@@ -337,12 +535,13 @@ class GR00TTransform(InvertibleModalityTransform):
 
         return transformed_data
 
+
     def apply_batch(self, data: dict, batch_size: int) -> dict:
         # Split on batch dimension.
         data_split = [tree.map_structure(lambda x: x[i], data) for i in range(batch_size)]
         # Process each element.
         data_split_processed = [self.apply_single(elem) for elem in data_split]
-        return collate(data_split_processed, self.eagle_processor)
+        return collate(data_split_processed, self.eagle_processor, self.training)
 
     def apply(self, data: dict) -> dict:
         is_batched, batch_size = self.check_keys_and_batch_size(data)
@@ -354,6 +553,11 @@ class GR00TTransform(InvertibleModalityTransform):
     def unapply(self, data: dict) -> dict:
         # Leave as is so that ConcatTransform can split the values
         return data
+
+    def unapply_reasoning(self, data):
+        # Leave as is so that ConcatTransform can split the values
+        texts = [self.eagle_processor.decode(ids, skip_special_tokens=True) for ids in data]
+        return texts
 
     def __call__(self, data: dict) -> dict:
         return self.apply(data)

@@ -489,10 +489,17 @@ class Eagle2_5_VLProcessor(ProcessorMixin):
             num_of_videos_in_this_sample,
         )
 
+    def merge_dict_tensors(self, dict_list):
+        merged = {}
+        for key in dict_list[0].keys():
+            merged[key] = torch.cat([d[key] for d in dict_list], dim=1)
+        return merged
+
     def __call__(
         self,
         images: ImageInput = None,
         text: Union[TextInput, PreTokenizedInput, List[TextInput], List[PreTokenizedInput]] = None,
+        target_text: Union[TextInput, PreTokenizedInput, List[TextInput], List[PreTokenizedInput]] = None,
         audio=None,
         videos: VideoInput = None,
         **kwargs: Unpack[Eagle2_5_VLProcessorKwargs],
@@ -540,6 +547,16 @@ class Eagle2_5_VLProcessor(ProcessorMixin):
         elif isinstance(text, list) and isinstance(text[0], str):
             text_list = text
 
+        #print(target_text)
+        if target_text is not None:
+            if isinstance(target_text, str):
+                target_text_list = [target_text]
+            elif not isinstance(target_text, list) and not isinstance(target_text[0], str):
+                raise ValueError("Invalid input text. Please provide a string, or a list of strings")
+            elif isinstance(target_text, list) and isinstance(target_text[0], str):
+                target_text_list = target_text
+
+
         if images is None:
             images = []
         if videos is None:
@@ -548,6 +565,7 @@ class Eagle2_5_VLProcessor(ProcessorMixin):
         pixel_values_list = []
         image_sizes_list = []
         new_sample_list = []
+        new_target_sample_list = []
         image_start_idx = 0
         video_start_idx = 0
         timestamps_batch = output_kwargs["videos_kwargs"].pop("timestamps", None)
@@ -578,6 +596,10 @@ class Eagle2_5_VLProcessor(ProcessorMixin):
             image_start_idx += num_of_images_in_this_sample
             video_start_idx += num_of_videos_in_this_sample
 
+        if target_text is not None:
+            for sample in target_text_list:
+                new_target_sample_list.append(sample)
+
         if len(pixel_values_list) > 0:
             image_inputs = {
                 "pixel_values": torch.cat(pixel_values_list),
@@ -587,7 +609,16 @@ class Eagle2_5_VLProcessor(ProcessorMixin):
             image_inputs = {}
         video_inputs = {}
         text_inputs = self.tokenizer(new_sample_list, **output_kwargs["text_kwargs"])
-        return BatchFeature(data={**text_inputs, **image_inputs, **video_inputs})
+        if target_text is not None:
+            text_outputs = self.tokenizer(new_target_sample_list, **output_kwargs["text_kwargs"])
+        #print(text_inputs)
+        #print(text_outputs)
+        if target_text is not None:
+            merged_texts = self.merge_dict_tensors([text_inputs, text_outputs])
+            return BatchFeature(data={**merged_texts, **image_inputs, **video_inputs})
+        else:
+            return BatchFeature(data={**text_inputs, **image_inputs, **video_inputs})
+            
 
     def get_number_tiles_based_on_image_size(
         self, image_size: tuple, min_num: int, max_num: int, use_thumbnail: bool, tile_size: int

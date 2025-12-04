@@ -19,9 +19,10 @@ from typing import Tuple
 import numpy as np
 import torch
 import tree
+from pydantic import Field
 from huggingface_hub import snapshot_download
 from huggingface_hub.errors import HFValidationError, RepositoryNotFoundError
-from transformers import AutoConfig, AutoModel, PretrainedConfig, PreTrainedModel
+from transformers import AutoConfig, AutoModel, PretrainedConfig, PreTrainedModel, AutoProcessor, ProcessorMixin
 from transformers.feature_extraction_utils import BatchFeature
 
 from .action_head.flow_matching_action_head import (
@@ -29,6 +30,7 @@ from .action_head.flow_matching_action_head import (
     FlowmatchingActionHeadConfig,
 )
 from .backbone import EagleBackbone
+from .backbone.eagle_backbone import DEFAULT_EAGLE_PATH
 
 BACKBONE_FEATURE_KEY = "backbone_features"
 ACTION_KEY = "action_pred"
@@ -82,9 +84,24 @@ class GR00T_N1_5(PreTrainedModel):
         action_head_cfg = FlowmatchingActionHeadConfig(**config.action_head_cfg)
         self.action_head = FlowmatchingActionHead(action_head_cfg)
 
+        def build_eagle_processor(eagle_path: str):
+            eagle_processor = AutoProcessor.from_pretrained(
+                eagle_path, trust_remote_code=True, use_fast=True
+            )
+            eagle_processor.tokenizer.padding_side = "left"
+            
+            eagle_processor.model_max_length = 64
+            eagle_processor.tokenizer.truncation_side = "right"
+            eagle_processor.tokenizer.pad_token = eagle_processor.tokenizer.eos_token
+            return eagle_processor
+
+        #self.eagle_processor: ProcessorMixin = Field(default=build_eagle_processor(DEFAULT_EAGLE_PATH))
+        self.eagle_processor = build_eagle_processor(DEFAULT_EAGLE_PATH)
+
         self.action_horizon = config.action_horizon
         self.action_dim = config.action_dim
         self.compute_dtype = config.compute_dtype
+        self.reasoning_lamb = 1.0
 
     def validate_inputs(self, inputs):
         # NOTE -- this should be handled internally by the model
@@ -164,7 +181,11 @@ class GR00T_N1_5(PreTrainedModel):
     ) -> BatchFeature:
         backbone_inputs, action_inputs = self.prepare_input(inputs)
         backbone_outputs = self.backbone(backbone_inputs)
+        #print(backbone_outputs)
         action_head_outputs = self.action_head(backbone_outputs, action_inputs)
+        #if backbone_outputs["language_loss"] is not None:
+        action_head_outputs["loss"] += self.reasoning_lamb * backbone_outputs["language_loss"]
+        #print(action_head_outputs)
         self.validate_data(action_head_outputs, backbone_outputs, is_training=True)
         return action_head_outputs
 
@@ -177,39 +198,19 @@ class GR00T_N1_5(PreTrainedModel):
         backbone_outputs = self.backbone(backbone_inputs)
         action_head_outputs = self.action_head.get_action(backbone_outputs, action_inputs)
         self.validate_data(action_head_outputs, backbone_outputs, is_training=False)
-        return action_head_outputs
-
-    def get_action_rtc(
-        self,
-        inputs: dict,
-    ) -> BatchFeature:
-        backbone_inputs, action_inputs = self.prepare_input(inputs)
-        # Because the behavior of backbones remains the same for training and inference, we can use `forward` for backbones.
-        backbone_outputs = self.backbone(backbone_inputs)
-        action_head_outputs = self.action_head.get_action_rtc(backbone_outputs, action_inputs)
-        self.validate_data(action_head_outputs, backbone_outputs, is_training=False)
-        return action_head_outputs
+        return action_head_outputs, backbone_outputs["pred_target_ids"]
 
     def prepare_input(self, inputs) -> Tuple[BatchFeature, BatchFeature]:
         self.validate_inputs(inputs)
         backbone_inputs = self.backbone.prepare_input(inputs)
         action_inputs = self.action_head.prepare_input(inputs)
 
-        # def to_device_with_maybe_dtype(x):
-        #     # Only cast to self.compute_dtype if the tensor is floating
-        #     if torch.is_floating_point(x):
-        #         return x.to(self.device, dtype=self.action_head.dtype)
-        #     else:
-        #         # Keep original dtype
-        #         return x.to(self.device)
-
         def to_device_with_maybe_dtype(x):
-            # Tensor 以外（float, int, list, None, numpy 等）はそのまま返す
-            if not isinstance(x, torch.Tensor):
-                return x
+            # Only cast to self.compute_dtype if the tensor is floating
             if torch.is_floating_point(x):
                 return x.to(self.device, dtype=self.action_head.dtype)
             else:
+                # Keep original dtype
                 return x.to(self.device)
 
         backbone_inputs = tree.map_structure(to_device_with_maybe_dtype, backbone_inputs)
@@ -251,30 +252,6 @@ class GR00T_N1_5(PreTrainedModel):
         pretrained_model.action_head.set_trainable_parameters(
             tune_projector=tune_projector, tune_diffusion_model=tune_diffusion_model
         )
-
-        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-
-        # まずモデル全体を移動
-        pretrained_model.to(device)
-        pretrained_model.eval()
-
-        # LayerNorm を含む正規化層を明示的に揃える（dtype も action_head 側に合わせる）
-        target_dtype = getattr(pretrained_model.action_head, "dtype", None)
-        for m in pretrained_model.modules():
-            if isinstance(m, torch.nn.LayerNorm):
-                m.to(device=device, dtype=target_dtype)
-
-        # （任意）検査：CPUに残存していないか
-        bad = []
-        for n, p in pretrained_model.named_parameters():
-            if p.device.type != device.type:
-                bad.append((n, p.device))
-        for n, b in pretrained_model.named_buffers():
-            if b.device.type != device.type:
-                bad.append((n, b.device))
-        if bad:
-            print("[WARN] tensors not on target device:", bad[:10], "...")
-
         return pretrained_model
 
 
