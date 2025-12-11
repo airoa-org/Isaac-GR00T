@@ -248,7 +248,7 @@ class EagleBackbone(nn.Module):
 
         eagle_features = self.eagle_linear(eagle_features)
         if self.training and self.tune_llm:
-            pred_ids = eagle_output_org.logits.argmax(dim=-1)              
+            pred_ids = eagle_output.logits.argmax(dim=-1)              
             target_mask = (eagle_input['labels'] != value)                       
             pred_target_ids = [pred_ids[b][target_mask[b]] for b in range(pred_ids.size(0))]
         else:
@@ -270,7 +270,7 @@ class EagleBackbone(nn.Module):
             # 3) ターゲット部分だけ抜き出し→デコード（あなたの採用方法そのまま）
             pred_target_ids = [new_texts[0]]
         
-        return eagle_features, eagle_input["attention_mask"], eagle_output_org, pred_target_ids
+        return eagle_features, eagle_input["attention_mask"], eagle_output, pred_target_ids
 
     def forward(self, vl_input: BatchFeature) -> BatchFeature:
         self.set_frozen_modules_to_eval_mode()
@@ -302,11 +302,11 @@ class EagleBackbone(nn.Module):
                     shift_labels.view(-1),
                     ignore_index=self.eagle_model.config.pad_token_id,
                 )
-        #eagle_embeds2 = eagle_embeds.detach()
+        eagle_embeds2 = eagle_embeds.detach()
 
-        #return BatchFeature(
-        #    data={"backbone_features": eagle_embeds2, "backbone_attention_mask": eagle_mask, "backbone_lastfeature": eagle_output, "pred_target_ids": pred_target_ids, "language_loss": language_loss}
-        #)  # [B, T2, hidden_size]
         return BatchFeature(
-            data={"backbone_features": eagle_embeds, "backbone_attention_mask": eagle_mask, "backbone_lastfeature": eagle_output, "pred_target_ids": pred_target_ids, "language_loss": language_loss}
+            data={"backbone_features": eagle_embeds2, "backbone_attention_mask": eagle_mask, "backbone_lastfeature": eagle_output, "pred_target_ids": pred_target_ids, "language_loss": language_loss}
         )  # [B, T2, hidden_size]
+        #return BatchFeature(
+        #    data={"backbone_features": eagle_embeds, "backbone_attention_mask": eagle_mask, "backbone_lastfeature": eagle_output, "pred_target_ids": pred_target_ids, "language_loss": language_loss}
+        #)  # [B, T2, hidden_size]

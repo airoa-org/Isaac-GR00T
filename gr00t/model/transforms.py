@@ -249,7 +249,7 @@ class GR00TTransform(InvertibleModalityTransform):
         # Handle language
         if "language" in grouped_keys:
             #language_keys = grouped_keys["language"]
-            language_keys = ["annotation.human.action.task_description", "annotation.reason.physical_property"]
+            language_keys = ["annotation.human.task_description", "annotation.reason.subtask_description"]
             assert len(language_keys) == 2, f"{language_keys=}"
             self._language_key = language_keys
         return is_batched, batch_size
