@@ -123,6 +123,7 @@ class RelativeActionLoader:
         assert action_key in MODALITY_CONFIGS[embodiment_tag.value]["action"].modality_keys
         idx = MODALITY_CONFIGS[embodiment_tag.value]["action"].modality_keys.index(action_key)
         action_configs = MODALITY_CONFIGS[embodiment_tag.value]["action"].action_configs
+        #print(MODALITY_CONFIGS[embodiment_tag.value]['state'].modality_keys)
         assert action_configs is not None, MODALITY_CONFIGS[embodiment_tag.value]["action"]
         self.action_config = action_configs[idx]
         self.modality_configs["action"] = ModalityConfig(
@@ -130,11 +131,16 @@ class RelativeActionLoader:
             modality_keys=[action_key],
         )
         # Check state config
-        state_key = self.action_config.state_key or action_key
-        assert state_key in MODALITY_CONFIGS[embodiment_tag.value]["state"].modality_keys
+        #print(self.action_config.state_key)
+        #print(action_key)
+        #state_key = self.action_config.state_key or action_key
+        state_key = MODALITY_CONFIGS[embodiment_tag.value]['state'].modality_keys
+        #print(state_key)
+        #print(MODALITY_CONFIGS[embodiment_tag.value]["state"].modality_keys)
+        #assert state_key in MODALITY_CONFIGS[embodiment_tag.value]["state"].modality_keys
         self.modality_configs["state"] = ModalityConfig(
             delta_indices=MODALITY_CONFIGS[embodiment_tag.value]["state"].delta_indices,
-            modality_keys=[state_key],
+            modality_keys=state_key,
         )
         # Check state-action consistency
         assert (
@@ -148,14 +154,19 @@ class RelativeActionLoader:
 
         # OPTIMIZATION: Extract columns once and convert to numpy arrays
         # This eliminates repeated DataFrame.__getitem__ and Series.__getitem__ calls
-        if self.action_config.state_key is not None:
-            state_key = f"state.{self.action_config.state_key}"
-        else:
-            state_key = f"state.{self.action_key}"
+        # if self.action_config.state_key is not None:
+        #     state_key = f"state.{self.action_config.state_key}"
+        # else:
+        #     state_key = f"state.{self.action_key}"
+        state_keys = self.modality_configs["state"].modality_keys
         action_key = f"action.{self.action_key}"
+        
 
         # Convert to numpy arrays once - this is much faster than repeated pandas access
-        state_data = df[state_key].values  # Shape: (episode_length, joint_dim)
+        #state_data = df[state_key].values  # Shape: (episode_length, joint_dim)
+        state_arrays = [df[f"state.{k}"].values for k in state_keys]
+        state_data = np.concatenate(state_arrays, axis=-1)
+
         action_data = df[action_key].values  # Shape: (episode_length, joint_dim)
         trajectories = []
         usable_length = len(df) - self.modality_configs["action"].delta_indices[-1]
@@ -249,7 +260,7 @@ def generate_rel_stats(dataset_path: Path | str, embodiment_tag: EmbodimentTag) 
 
 def main(dataset_path: Path | str, embodiment_tag: EmbodimentTag):
     generate_stats(dataset_path)
-    generate_rel_stats(dataset_path, embodiment_tag)
+    #generate_rel_stats(dataset_path, embodiment_tag)
 
 
 if __name__ == "__main__":

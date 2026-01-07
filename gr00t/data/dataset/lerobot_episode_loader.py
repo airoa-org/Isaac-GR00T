@@ -260,7 +260,9 @@ class LeRobotEpisodeLoader:
             DataFrame with columns for each requested joint group containing sliced arrays
         """
         modality_info = self.modality_meta.get(modality_type, {})
+        #print(modality_info)
         joint_data = pd.DataFrame()
+        #print(joint_groups)
 
         for group_name in joint_groups:
             if group_name in modality_info:
