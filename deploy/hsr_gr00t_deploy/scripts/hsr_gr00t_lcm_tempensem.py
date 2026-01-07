@@ -306,7 +306,7 @@ def main():
     print("Start Issac-GR00T")
 
     # TODO: 引数でいい感じに処理するようにする
-    checkpoint_dir = "/home/veluga-g3/airoa/ckpt/gr00t-050607"
+    checkpoint_dir = "s3://airoa-fm-development-competition/group6/st2-mid-checkpoint"
     adopted_action_chunks = 32
     use_temp_ensem = False
 

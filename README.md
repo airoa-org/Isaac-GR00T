@@ -387,7 +387,7 @@ hsr_gr00t_lcm_tempensem.pyを直接編集し、推論対象のモデルを指定
 ```
 vim deploy/hsr_gr00t_deploy/scripts/hsr_gr00t_lcm_tempensem.py
 # 306行目付近を編集
-# checkpoint_dir = "/path/to/hsr_checkpoint"
+# checkpoint_dir = "s3://airoa-fm-development-competition/group6/st2-mid-checkpoint"
 ```
 推論ノードを実行します。
 ```
