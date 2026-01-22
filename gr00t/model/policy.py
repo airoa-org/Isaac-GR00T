@@ -34,12 +34,15 @@ COMPUTE_DTYPE = torch.bfloat16
 
 class BasePolicy(ABC):
     @abstractmethod
-    def get_action(self, observations: Dict[str, Any]) -> Dict[str, Any]:
+    def get_action(
+        self, observations: Dict[str, Any], config: Dict[str, Any] = None
+    ) -> Dict[str, Any]:
         """
         Abstract method to get the action for a given state.
 
         Args:
             observations: The observations from the environment.
+            config: The inference config for the policy.
 
         Returns:
             The action to take in the environment in dictionary format.
@@ -143,11 +146,14 @@ class Gr00tPolicy(BasePolicy):
         """
         return self._modality_transform.unapply(action)
 
-    def get_action(self, observations: Dict[str, Any]) -> Dict[str, Any]:
+    def get_action(
+        self, observations: Dict[str, Any], config: Dict[str, Any] = None
+    ) -> Dict[str, Any]:
         """
         Make a prediction with the model.
         Args:
             obs (Dict[str, Any]): The observation to make a prediction for.
+            config (Dict[str, Any]): The inference config for the policy.
 
         e.g. obs = {
             "video.<>": np.ndarray,  # (T, H, W, C)
@@ -165,151 +171,48 @@ class Gr00tPolicy(BasePolicy):
         Returns:
             Dict[str, Any]: The predicted action.
         """
-        # let the get_action handles both batch and single input
-        is_batch = self._check_state_is_batched(observations)
+        # Create a copy to avoid mutating input
+        obs_copy = observations.copy()
+
+        is_batch = self._check_state_is_batched(obs_copy)
         if not is_batch:
-            observations = unsqueeze_dict_values(observations)
+            obs_copy = unsqueeze_dict_values(obs_copy)
 
-        # NOTE(YL): ensure keys are all in numpy array
-        for k, v in observations.items():
+        # Convert to numpy arrays
+        for k, v in obs_copy.items():
             if not isinstance(v, np.ndarray):
-                observations[k] = np.array(v)
+                obs_copy[k] = np.array(v)
 
-        # Apply transforms
-        normalized_input = self.apply_transforms(observations)
+        # We will set the inference config for the model, which includes the denoising steps, rtc steps, and rtc freeze steps
+        if config is not None:
+            self.model.action_head.num_inference_timesteps = config.get(
+                "denoising_steps", 16
+            )  # TODO: hardcoded to default 16
+            self.model.action_head.config.inference_rtc_overlap_steps = config.get(
+                "rtc_overlap_steps", None
+            )
+            self.model.action_head.config.inference_rtc_frozen_steps = config.get(
+                "rtc_frozen_steps", None
+            )
+            # check if rtc_steps is greater than rtc_freeze_steps if they are defined or non-None
+            if "rtc_overlap_steps" in config and config["rtc_overlap_steps"] is not None:
+                assert (
+                    self.model.action_head.config.inference_rtc_overlap_steps
+                    >= self.model.action_head.config.inference_rtc_frozen_steps
+                ), "rtc_overlap_steps must be greater than or equal to rtc_frozen_steps"
 
+        normalized_input = self.apply_transforms(obs_copy)
         normalized_action = self._get_action_from_normalized_input(normalized_input)
         unnormalized_action = self._get_unnormalized_action(normalized_action)
+
         if not is_batch:
             unnormalized_action = squeeze_dict_values(unnormalized_action)
         return unnormalized_action
-
-    def prepare_action_prev(self, data: dict):
-        """
-        Pad to max_action_dim, return masks.
-        """
-
-        actions = data[0]
-        if isinstance(actions, torch.Tensor):
-            actions = actions.detach().cpu().numpy()
-        assert actions.shape[0] == self.model.action_head.action_horizon, f"{actions.shape=}, {self.model.action_head.action_horizon=}"
-
-        n_action_tokens = actions.shape[0]  # T
-        n_action_dims = actions.shape[1]
-
-        assert (
-            n_action_dims <= self.model.action_head.action_dim
-        ), f"Action dim {n_action_dims} exceeds max allowed {self.model.action_head.action_dim}."
-
-        # Pad the channel dimension
-        actions = np.pad(actions, ((0, 0), (0, self.model.action_head.action_dim - n_action_dims)), "constant")
-
-        # Create mask: [T, max_action_dim]
-        actions_mask = np.zeros((n_action_tokens, self.model.action_head.action_dim), dtype=bool)
-        actions_mask[:, :n_action_dims] = True
-
-        return actions, actions_mask, n_action_tokens
-
-
-    def get_action_rtc(self, observations: Dict[str, Any], rtc: Dict[str, Any]) -> Dict[str, Any]:
-        # 1) 観測は通常どおり正規化（video/state/text）
-        is_batch = self._check_state_is_batched(observations)
-        if not is_batch:
-            observations = unsqueeze_dict_values(observations)
-        obs_np = {k: (v if isinstance(v, np.ndarray) else np.array(v)) for k, v in observations.items()}
-        normalized_input = self.apply_transforms(obs_np)   # ← Transform は観測のみ
-
-        # 2) 前チャンクは action 統計で手動正規化して合流
-        if rtc.get("rtc_prev_action", None) is not None:
-            prev = rtc["rtc_prev_action"]  # 非正規化 [H,D] or [B,H,D]
-            # # 必要なら右パディング（推奨：先に呼び出し側で H に揃える）
-            # H = self.model.action_head.action_horizon
-            # if isinstance(prev, np.ndarray) and prev.ndim == 2 and prev.shape[0] != H:
-            #     if prev.shape[0] < H:
-            #         pad = np.zeros((H - prev.shape[0], prev.shape[1]), dtype=prev.dtype)
-            #         prev = np.concatenate([prev, pad], axis=0)
-            #     else:
-            #         prev = prev[:H]
-            prev_norm = self._normalize_prev_action_with_stats(prev)  # torch [B,H,D]
-
-
-            actions, actions_mask, n_action_tokens = self.prepare_action_prev(prev_norm)
-
-            adtype = self.model.action_head.dtype if hasattr(self.model.action_head, "dtype") else torch.float32
-            dev    = self.device
-
-            A_prev_t = torch.as_tensor(actions, device=dev, dtype=adtype).unsqueeze(0)
-
-            normalized_input["rtc_prev_action"] = A_prev_t
-
-            if rtc.get("rtc_weight_mask", None) is not None:
-                W = rtc["rtc_weight_mask"]
-                W = W if isinstance(W, torch.Tensor) else torch.as_tensor(W, device=dev, dtype=adtype)
-            else:
-                # W 未指定なら “とりあえず全 1（先頭/末尾の整形は上位側で）”
-                W = torch.ones((1, actions.shape[0], 1), device=dev, dtype=adtype)
-
-            # [H,D] の actions_mask を [1,H,D] にして掛ける
-            am = torch.as_tensor(actions_mask, device=dev, dtype=adtype).unsqueeze(0)
-            if W.shape[-1] == 1:
-                W = W.expand(-1, am.shape[1], am.shape[2])
-            W = W * am
-
-            normalized_input["rtc_weight_mask"] = W
-
-
-
-        # 3) 付帯（W, beta, clip, angle idx）を Tensor 化して追加
-        device = self.device
-        dtype  = (self.model.action_head.dtype
-                if hasattr(self.model.action_head, "dtype") else torch.float32)
-
-        # if rtc.get("rtc_weight_mask", None) is not None:
-        #     W = rtc["rtc_weight_mask"]
-        #     normalized_input["rtc_weight_mask"] = (
-        #         W if isinstance(W, torch.Tensor) else torch.as_tensor(W, device=device, dtype=dtype)
-        #     )
-
-        
-
-        if rtc.get("rtc_beta", None) is not None:
-            beta = rtc["rtc_beta"]
-            normalized_input["rtc_beta"] = (
-                beta if isinstance(beta, torch.Tensor) else torch.tensor(float(beta), device=device, dtype=dtype)
-            )
-
-        if rtc.get("rtc_guidance_clip", None) is not None:
-            clip = rtc["rtc_guidance_clip"]
-            normalized_input["rtc_guidance_clip"] = (
-                clip if isinstance(clip, torch.Tensor) else torch.tensor(float(clip), device=device, dtype=dtype)
-            )
-
-        if rtc.get("rtc_angle_indices", None) is not None:
-            idx = rtc["rtc_angle_indices"]
-            normalized_input["rtc_angle_indices"] = (
-                idx if isinstance(idx, torch.Tensor) else torch.as_tensor(idx, device=device, dtype=torch.long)
-            )
-        # 4) モデル実行（RTC対応パス）
-        normalized_action = self._get_action_rtc_from_normalized_input(normalized_input)
-        unnormalized_action = self._get_unnormalized_action(normalized_action)
-        if not is_batch:
-            unnormalized_action = squeeze_dict_values(unnormalized_action)
-        return unnormalized_action
-
-
 
     def _get_action_from_normalized_input(self, normalized_input: Dict[str, Any]) -> torch.Tensor:
         # Set up autocast context if needed
         with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=COMPUTE_DTYPE):
             model_pred = self.model.get_action(normalized_input)
-
-        normalized_action = model_pred["action_pred"].float()
-        return normalized_action
-
-    def _get_action_rtc_from_normalized_input(self, normalized_input: Dict[str, Any]) -> torch.Tensor:
-        # Set up autocast context if needed
-        with torch.autocast(device_type="cuda", dtype=COMPUTE_DTYPE):
-            model_pred = self.model.get_action_rtc(normalized_input)
 
         normalized_action = model_pred["action_pred"].float()
         return normalized_action
@@ -360,7 +263,6 @@ class Gr00tPolicy(BasePolicy):
     def _load_model(self, model_path):
         model = GR00T_N1_5.from_pretrained(model_path, torch_dtype=COMPUTE_DTYPE)
         model.eval()  # Set model to eval mode
-        model.to(device=self.device)  # type: ignore
 
         # Update action_horizon to match modality config
         # Get the expected action horizon from the modality config
@@ -394,13 +296,7 @@ class Gr00tPolicy(BasePolicy):
             model.action_horizon = expected_action_horizon
             model.config.action_head_cfg["action_horizon"] = expected_action_horizon
 
-        model.action_head.to(device=self.device, dtype=COMPUTE_DTYPE)
-
-        # LayerNorm 系を最後にもう一度強制で揃える（保険）
-        for m in model.modules():
-            if isinstance(m, torch.nn.LayerNorm):
-                m.to(device=self.device, dtype=COMPUTE_DTYPE)
-
+        model.to(device=self.device)  # type: ignore
 
         self.model = model
 
@@ -454,80 +350,6 @@ class Gr00tPolicy(BasePolicy):
             # And the step is positive
             assert (delta_indices[1] - delta_indices[0]) > 0, f"{delta_indices=}"
 
-    @torch.no_grad()
-    def build_rtc_weight_mask(self, H, d, s, lam=0.3, B=1, D=None, device="cuda", dtype=torch.float32):
-        """
-        先頭[0..d-1]=1, 中間[d..H-s-1]=exp(-lam*(t-d)), 末尾[H-s..H-1]=0
-        返り: [B,H,1] または [B,H,D]
-        """
-        d = torch.full((B,), int(d), device=device, dtype=torch.long)
-        s = torch.full((B,), int(s), device=device, dtype=torch.long)
-        d = d.clamp(min=0, max=H); s = torch.minimum(s, (H-d).clamp(min=0))
-        t = torch.arange(H, device=device).view(1, H, 1)
-        d_ = d.view(B,1,1); s_ = s.view(B,1,1)
-        freeze = (t < d_).float()
-        free   = (t >= (H - s_)).float()
-        mid    = (1.0 - freeze) * (1.0 - free)
-        k = (t - d_).clamp(min=0)
-        w_mid = torch.exp(-lam * k) * mid
-        W = (freeze + w_mid)  # 末尾は0のまま
-        if D is not None:
-            W = W.expand(B, H, D)
-        return W.to(dtype=dtype)
-
-    def get_action_rel_stats_tensors(self):
-        # DatasetStatisticalValues を取得（relative）
-        rel = self.metadata.statistics.action["relative"]  # or: self.metadata.statistics.action.relative
-
-        mean = torch.as_tensor(rel.mean, device=self.device, dtype=torch.float32).view(1, 1, -1)
-        std  = torch.as_tensor(rel.std,  device=self.device, dtype=torch.float32).clamp_min(1e-6).view(1, 1, -1)
-
-        return mean, std
-
-    def get_action_rel_stats_tensors(self):
-        rel = self.metadata.statistics.action["relative"]
-        mean = torch.as_tensor(rel.mean, device=self.device, dtype=torch.float32).view(1,1,-1)
-        # 下限を 1e-2 に引き上げ（まずは安全側）
-        std  = torch.as_tensor(rel.std,  device=self.device, dtype=torch.float32).clamp_min(1e-2).view(1,1,-1)
-        return mean, std
-
-    def _normalize_prev_action_with_stats(self, prev):
-        if isinstance(prev, np.ndarray):
-            prev = torch.from_numpy(prev)
-        if not isinstance(prev, torch.Tensor):
-            prev = torch.as_tensor(prev)
-        if prev.ndim == 2:
-            prev = prev.unsqueeze(0)  # [H,D] -> [1,H,D]
-
-        mean, std = self.get_action_rel_stats_tensors()
-        prev = prev.to(device=self.device, dtype=torch.float32)
-        prev_norm = (prev - mean) / std
-        # ★ サニタイズ（超重要）
-        prev_norm = torch.nan_to_num(prev_norm, nan=0.0, posinf=0.0, neginf=0.0)
-        prev_norm = prev_norm.clamp_(-8.0, 8.0)
-        return prev_norm
-
-
-
-    # def _normalize_prev_action_with_stats(self, prev):
-    #     """
-    #     prev: [H,D] or [B,H,D] in *unnormalized (world)* space
-    #     returns: torch.Tensor [B,H,D] in *normalized* space
-    #     """
-    #     if isinstance(prev, np.ndarray):
-    #         prev = torch.from_numpy(prev)
-    #     if not isinstance(prev, torch.Tensor):
-    #         prev = torch.as_tensor(prev)
-
-    #     if prev.ndim == 2:  # [H,D] -> [1,H,D]
-    #         prev = prev.unsqueeze(0)
-
-    #     mean, std = self.get_action_rel_stats_tensors()
-    #     prev = prev.to(device=self.device, dtype=torch.float32)
-    #     prev_norm = (prev - mean) / std
-    #     return prev_norm
-
-
 
 #######################################################################################################
 
@@ -543,7 +365,7 @@ def unsqueeze_dict_values(data: Dict[str, Any]) -> Dict[str, Any]:
         if isinstance(v, np.ndarray):
             unsqueezed_data[k] = np.expand_dims(v, axis=0)
         elif isinstance(v, list):
-            unsqueezed_data[k] = np.array(v)
+            unsqueezed_data[k] = np.expand_dims(np.array(v), axis=0)  # Fixed
         elif isinstance(v, torch.Tensor):
             unsqueezed_data[k] = v.unsqueeze(0)
         else:
@@ -558,9 +380,9 @@ def squeeze_dict_values(data: Dict[str, Any]) -> Dict[str, Any]:
     squeezed_data = {}
     for k, v in data.items():
         if isinstance(v, np.ndarray):
-            squeezed_data[k] = np.squeeze(v)
+            squeezed_data[k] = np.squeeze(v, axis=0)  # Fixed: only remove batch dim
         elif isinstance(v, torch.Tensor):
-            squeezed_data[k] = v.squeeze()
+            squeezed_data[k] = v.squeeze(0)  # Fixed: only remove batch dim
         else:
             squeezed_data[k] = v
     return squeezed_data

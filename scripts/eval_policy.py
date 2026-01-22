@@ -15,15 +15,15 @@
 
 import warnings
 from dataclasses import dataclass, field
-from typing import List, Literal
+from typing import Any, Dict, List, Literal, Optional
 
 import numpy as np
 import tyro
 
-from gr00t.data.dataset import LeRobotSingleDataset
+from gr00t.data.dataset import LeRobotSingleDataset, ModalityConfig
 from gr00t.data.embodiment_tags import EMBODIMENT_TAG_MAPPING
 from gr00t.eval.robot import RobotInferenceClient
-from gr00t.experiment.data_config import DATA_CONFIG_MAP
+from gr00t.experiment.data_config import load_data_config
 from gr00t.model.policy import BasePolicy, Gr00tPolicy
 from gr00t.utils.eval import calc_mse_for_single_trajectory
 
@@ -36,6 +36,7 @@ NOTE: provide --model_path to load up the model checkpoint in this script,
         else it will use the default host and port via RobotInferenceClient
 
 python scripts/eval_policy.py --plot --model-path nvidia/GR00T-N1.5-3B
+
 """
 
 
@@ -55,8 +56,12 @@ class ArgsConfig:
     modality_keys: List[str] = field(default_factory=lambda: ["right_arm", "left_arm"])
     """Modality keys to evaluate."""
 
-    data_config: Literal[tuple(DATA_CONFIG_MAP.keys())] = "fourier_gr1_arms_only"
-    """Data config to use."""
+    data_config: str = "fourier_gr1_arms_only"
+    """
+    Data config to use, e.g. so100, fourier_gr1_arms_only, unitree_g1, etc.
+    Or a path to a custom data config file. e.g. "module:ClassName" format.
+    See gr00t/experiment/data_config.py for more details.
+    """
 
     steps: int = 150
     """Number of steps to evaluate."""
@@ -64,10 +69,13 @@ class ArgsConfig:
     trajs: int = 1
     """Number of trajectories to evaluate."""
 
-    action_horizon: int = None
-    """Action horizon to evaluate. If None, will use the data config's action horizon."""
+    start_traj: int = 0
+    """Start trajectory to evaluate."""
 
-    video_backend: Literal["decord", "torchvision_av"] = "decord"
+    execution_horizon: Optional[int] = None
+    """Execution horizon to evaluate. If None, will use the data config's action horizon."""
+
+    video_backend: Literal["decord", "torchvision_av", "torchcodec"] = "torchcodec"
     """Video backend to use for various codec options. h264: decord or av: torchvision_av"""
 
     dataset_path: str = "demo_data/robot_sim.PickNPlace/"
@@ -82,17 +90,45 @@ class ArgsConfig:
     denoising_steps: int = 4
     """Number of denoising steps to use."""
 
-    save_plot_path: str = None
+    inference_latency_steps: int = 0
+    """inference latency steps"""
+
+    rtc: bool = False
+    """Whether to run with rtc."""
+
+    save_plot_path: Optional[str] = None
     """Path to save the plot."""
+
+    plot_state: bool = False
+    """Whether to show the state on the plot."""
+
+
+class WrapPolicy(BasePolicy):
+    def __init__(self, policy: BasePolicy):
+        self.policy = policy
+
+    def set_config(self, config: Dict[str, Any]):
+        self._config = config
+
+    def get_action(
+        self, observations: Dict[str, Any], config: Dict[str, Any] = None
+    ) -> Dict[str, Any]:
+        assert config is None, "config should be None as we are using default config"
+        return self.policy.get_action(observations, self._config)
+
+    def get_modality_config(self) -> Dict[str, ModalityConfig]:
+        return self.policy.get_modality_config()
 
 
 def main(args: ArgsConfig):
-    data_config = DATA_CONFIG_MAP[args.data_config]
+    data_config = load_data_config(args.data_config)
 
     # Set action_horizon from data config if not provided
-    if args.action_horizon is None:
-        args.action_horizon = len(data_config.action_indices)
-        print(f"Using action_horizon={args.action_horizon} from data config '{args.data_config}'")
+    if args.execution_horizon is None:
+        args.execution_horizon = len(data_config.action_indices)
+        print(
+            f"Using execution_horizon={args.execution_horizon} from data config '{args.data_config}'"
+        )
 
     if args.model_path is not None:
         import torch
@@ -105,15 +141,41 @@ def main(args: ArgsConfig):
             modality_config=modality_config,
             modality_transform=modality_transform,
             embodiment_tag=args.embodiment_tag,
-            denoising_steps=args.denoising_steps,
             device="cuda" if torch.cuda.is_available() else "cpu",
         )
+        torch.manual_seed(42)  # Keep the same seed to ensure reproducibility
     else:
         policy: BasePolicy = RobotInferenceClient(host=args.host, port=args.port)
 
     # Get the supported modalities for the policy
     modality = policy.get_modality_config()
+    action_horizon = len(
+        modality["action"].delta_indices
+    )  # this is the originally trained action horizon
+
+    assert args.inference_latency_steps <= action_horizon - args.execution_horizon, (
+        "inference_latency_steps must be less than action_horizon - execution_horizon, "
+        "for example, if action horizon of 16 and execution of 10, "
+        "the inference latency steps cannot be larger than 6 during open-loop plotting"
+        f"inference_latency_steps: {args.inference_latency_steps}, "
+        f"action_horizon: {action_horizon}, "
+        f"execution_horizon: {args.execution_horizon}"
+    )
+
     print("Current modality config: \n", modality)
+
+    policy = WrapPolicy(policy)
+    if args.rtc:
+        print("\033[93m", "Running with Realtime Chunking", "\033[0m")
+        policy.set_config(
+            {
+                "denoising_steps": args.denoising_steps,
+                "rtc_overlap_steps": action_horizon - args.execution_horizon,
+                "rtc_frozen_steps": args.inference_latency_steps,
+            }
+        )
+    else:
+        policy.set_config({"denoising_steps": args.denoising_steps})
 
     # Create the dataset
     dataset = LeRobotSingleDataset(
@@ -145,7 +207,7 @@ def main(args: ArgsConfig):
     print("Running on all trajs with modality keys:", args.modality_keys)
 
     all_mse = []
-    for traj_id in range(args.trajs):
+    for traj_id in range(args.start_traj, args.start_traj + args.trajs):
         print("Running trajectory:", traj_id)
         mse = calc_mse_for_single_trajectory(
             policy,
@@ -153,9 +215,13 @@ def main(args: ArgsConfig):
             traj_id,
             modality_keys=args.modality_keys,
             steps=args.steps,
-            action_horizon=args.action_horizon,
+            execution_horizon=args.execution_horizon,
+            action_horizon=action_horizon,
+            inference_latency_steps=args.inference_latency_steps,
             plot=args.plot,
+            plot_state=args.plot_state,
             save_plot_path=args.save_plot_path,
+            rtc_enabled=args.rtc,
         )
         print("MSE:", mse)
         all_mse.append(mse)

@@ -49,7 +49,7 @@ import tyro
 
 from gr00t.data.embodiment_tags import EMBODIMENT_TAG_MAPPING
 from gr00t.eval.robot import RobotInferenceClient, RobotInferenceServer
-from gr00t.experiment.data_config import DATA_CONFIG_MAP
+from gr00t.experiment.data_config import load_data_config
 from gr00t.model.policy import Gr00tPolicy
 
 
@@ -63,13 +63,18 @@ class ArgsConfig:
     embodiment_tag: Literal[tuple(EMBODIMENT_TAG_MAPPING.keys())] = "gr1"
     """The embodiment tag for the model."""
 
-    data_config: Literal[tuple(DATA_CONFIG_MAP.keys())] = "fourier_gr1_arms_waist"
-    """The name of the data config to use."""
+    data_config: str = "fourier_gr1_arms_waist"
+    """
+    The name of the data config to use, e.g. so100, fourier_gr1_arms_only, unitree_g1, etc.
+
+    Or a path to a custom data config file. e.g. "module:ClassName" format.
+    See gr00t/experiment/data_config.py for more details.
+    """
 
     port: int = 5555
     """The port number for the server."""
 
-    host: str = "localhost"
+    host: str = "0.0.0.0"
     """The host address for the server."""
 
     server: bool = False
@@ -87,50 +92,8 @@ class ArgsConfig:
     http_server: bool = False
     """Whether to run it as HTTP server. Default is ZMQ server."""
 
-
-#####################################################################################
-
-
-def _example_zmq_client_call(obs: dict, host: str, port: int, api_token: str):
-    """
-    Example ZMQ client call to the server.
-    """
-    # Original ZMQ client mode
-    # Create a policy wrapper
-    policy_client = RobotInferenceClient(host=host, port=port, api_token=api_token)
-
-    print("Available modality config available:")
-    modality_configs = policy_client.get_modality_config()
-    print(modality_configs.keys())
-
-    time_start = time.time()
-    action = policy_client.get_action(obs)
-    print(f"Total time taken to get action from server: {time.time() - time_start} seconds")
-    return action
-
-
-def _example_http_client_call(obs: dict, host: str, port: int, api_token: str):
-    """
-    Example HTTP client call to the server.
-    """
-    import json_numpy
-
-    json_numpy.patch()
-    import requests
-
-    # Send request to HTTP server
-    print("Testing HTTP server...")
-
-    time_start = time.time()
-    response = requests.post(f"http://{host}:{port}/act", json={"observation": obs})
-    print(f"Total time taken to get action from HTTP server: {time.time() - time_start} seconds")
-
-    if response.status_code == 200:
-        action = response.json()
-        return action
-    else:
-        print(f"Error: {response.status_code} - {response.text}")
-        return {}
+    encode_video: bool = False
+    """With Zmq, Whether to encode the video to bytes to reduce image transfer bandwidth."""
 
 
 def main(args: ArgsConfig):
@@ -146,7 +109,7 @@ def main(args: ArgsConfig):
         # if a new data config is specified, this expect user to
         # construct your own modality config and transform
         # see gr00t/utils/data.py for more details
-        data_config = DATA_CONFIG_MAP[args.data_config]
+        data_config = load_data_config(args.data_config)
         modality_config = data_config.modality_config()
         modality_transform = data_config.transform()
 
@@ -160,7 +123,7 @@ def main(args: ArgsConfig):
 
         # Start the server
         if args.http_server:
-            from gr00t.eval.http_server import HTTPInferenceServer  # noqa: F401
+            from gr00t.eval.http_service import HTTPInferenceServer  # noqa: F401
 
             server = HTTPInferenceServer(
                 policy, port=args.port, host=args.host, api_token=args.api_token
@@ -199,9 +162,30 @@ def main(args: ArgsConfig):
         }
 
         if args.http_server:
-            action = _example_http_client_call(obs, args.host, args.port, args.api_token)
+            from gr00t.eval.http_service import HttpClientPolicy  # noqa: F401
+
+            policy_client = HttpClientPolicy(host=args.host, port=args.port)
         else:
-            action = _example_zmq_client_call(obs, args.host, args.port, args.api_token)
+            # Original ZMQ client mode
+            # Create a policy wrapper
+            policy_client = RobotInferenceClient(
+                host=args.host,
+                port=args.port,
+                api_token=args.api_token,
+                encode_video=args.encode_video,
+            )
+
+            print("Available modality config available:")
+            modality_configs = policy_client.get_modality_config()
+            print(modality_configs.keys())
+
+            # action = _example_zmq_client_call(
+            #     obs, args.host, args.port, args.api_token, args.encode_video
+            # )
+
+        time_start = time.time()
+        action = policy_client.get_action(obs)
+        print(f"Total time taken to get action from server: {time.time() - time_start} seconds")
 
         for key, value in action.items():
             print(f"Action: {key}: {value.shape}")
