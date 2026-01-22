@@ -287,7 +287,8 @@ class Gr00tHSRPolicy:
             return raw_action
         else:
             self.action_queue["action.relative"].extend(action_chunk["action.relative"][self.num_traj:self.adopted_action_chunks])
-            action_relative = self.action_queue["action.relative"].popleft()
+            #action_relative = self.action_queue["action.relative"].popleft()
+            action_relative = self.action_queue["action.relative"][0]
             #action_relative = self.actions_rel[self.frame_num]
             action_notemp = np.concatenate(
                 [
@@ -305,9 +306,11 @@ class Gr00tHSRPolicy:
             action_notemp = action_notemp + np.concatenate(
                 [obs["joint_state"][:5], np.array([0]), obs["joint_state"][6:8], np.array([0, 0, 0])]
             )
-            actions_notemp.append(action)
+            #actions_notemp.append(action)
+            actions_notemp.append(action_notemp)
 
-            return np.array(actions)
+            #return np.array(actions)
+            return np.array(actions_notemp)
 
         
 
