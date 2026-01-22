@@ -986,7 +986,7 @@ class HsrDataConfig(BaseDataConfig):
     ]
     language_keys = ["annotation.human.task_description"]
     observation_indices = [0]
-    action_indices = list(range(16))
+    action_indices = list(range(32))
 
     def modality_config(self) -> dict[str, ModalityConfig]:
         video_modality = ModalityConfig(
@@ -1076,7 +1076,7 @@ class HsrRelativeDataConfig(BaseDataConfig):
     ]
     language_keys = ["annotation.human.task_description"]
     observation_indices = [0]
-    action_indices = list(range(16))
+    action_indices = list(range(32))
 
     def modality_config(self) -> dict[str, ModalityConfig]:
         video_modality = ModalityConfig(

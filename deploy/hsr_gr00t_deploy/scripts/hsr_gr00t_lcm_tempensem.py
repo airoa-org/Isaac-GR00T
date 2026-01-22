@@ -1,11 +1,10 @@
-#!/home/openpi/.venv/bin/python3
-from collections import deque
-
 #!/usr/bin/env python3
 from typing import Any
+from collections import deque
 
 import cv2
 import numpy as np
+import copy
 
 # gr00t関連
 from gr00t.data.dataset import LeRobotSingleDataset
@@ -35,7 +34,7 @@ def compressedimage_to_array_lcm(msg):
 class HSRLcmServer:
     GRIPPER_OPEN = 1
     GRIPPER_CLOSE = 0
-    GRIPPER_CLOSE_THRESHOLD = 0.1  # グリッパーを閉じる閾値
+    GRIPPER_CLOSE_THRESHOLD = 0.5  # グリッパーを閉じる閾値
 
     def __init__(self, policy, traj_hz=10.0):
         self.traj_hz = float(traj_hz)
@@ -135,6 +134,7 @@ class Gr00tHSRPolicy:
         self.action_queue = {
             "action.relative": deque(maxlen=self.adopted_action_chunks),  
         }
+        self.griper_queue = deque(maxlen=3)
         #print(self.action_queue)
         self.num_traj = num_traj
         rand_img = np.random.randint(0, 256, (256, 256, 3), dtype=np.uint8)
@@ -146,8 +146,8 @@ class Gr00tHSRPolicy:
         }
         #self.reset_buffer()
 
-        replay_episode = np.load("/home/veluga-g3/Downloads/episode_1511_action_relative.npz", allow_pickle=False)
-        self.actions_rel = replay_episode["actions"]
+        #replay_episode = np.load("/home/veluga-g3/Downloads/episode_1511_action_relative.npz", allow_pickle=False)
+        #self.actions_rel = replay_episode["actions"]
         self.frame_num = 0
 
         self.use_temp_ensem = use_temp_ensem          # 無効にしたい時は False
@@ -164,6 +164,7 @@ class Gr00tHSRPolicy:
     
     def reset_buffer(self):
         self.action_queue.clear()
+        self.griper_queue.clear()
         self.t = 0
 
     def act(self, obs: dict[str, Any]) -> np.ndarray:
@@ -192,19 +193,25 @@ class Gr00tHSRPolicy:
                 "base_t",
             ]
         """
+        #print(obs)
         if not self.use_temp_ensem:
             if len(self.action_queue["action.relative"]) >= self.num_traj:
                 actions = []
                 for _ in range(self.num_traj):
                     action_relative = self.action_queue["action.relative"].popleft()
                     #action_relative = self.actions_rel[self.frame_num]
+                    if obs["joint_state"][5] > (action_relative[5] + 0.1) and obs["joint_state"][5] < 1.2:
+                        gripper_action = obs["joint_state"][5]
+                    else:
+                        gripper_action = action_relative[5]
                     action = np.concatenate(
                         [
                             action_relative[0:5],
-                            [action_relative[5]],
+                            [gripper_action],
                             #action_relative[7:9],
                             #action_relative[9:12],
-                            action_relative[6:8],
+                            #action_relative[6:8],
+                            [0.0,0.0],
                             action_relative[8:11],
                         ]
                     )
@@ -241,12 +248,18 @@ class Gr00tHSRPolicy:
         actions_notemp = []
         for i in range(len(action_chunk["action.relative"])):
             action_relative = action_chunk["action.relative"][i]
+            #if obs["joint_state"][5] > action_relative[5] and obs["joint_state"][5] < 1.2:
+            #    gripper_action = obs["joint_state"][5]
+            #else:
+            #    gripper_action = action_relative[5]
+            gripper_action = action_relative[5]
             action = np.concatenate(
                 [
                     action_relative[0:5],
-                    [action_relative[5]],
+                    [gripper_action],
                     #[0.5],
-                    action_relative[6:8],
+                    #action_relative[6:8],
+                    [0.0,0.0],
                     action_relative[8:11],
                 ]
             )
@@ -269,7 +282,16 @@ class Gr00tHSRPolicy:
             exp_weights = torch.from_numpy(exp_weights).cuda().unsqueeze(dim=1)
             raw_action = (actions_for_curr_step * exp_weights).sum(dim=0, keepdim=True)
             #raw_action[5] = 1.2
-            print(raw_action)
+            print(raw_action[0][5])
+            print(obs["joint_state"][5])
+            gripper_action = copy.copy(raw_action).cpu().numpy()
+            
+            #if (gripper_action[0][5] - 0.1) < obs["joint_state"][5]:
+            #    raw_action[0][5] = torch.tensor(obs["joint_state"][5])
+            #if gripper_action[0][5] < 0.6:
+            #    raw_action[0][5] = -0.6
+            #self.griper_queue.extend([obs["joint_state"][5]])
+            #print(np.self.griper_queue)
             self.t += 1
 
             return raw_action
@@ -284,10 +306,12 @@ class Gr00tHSRPolicy:
                     #[1.2],
                     #action_relative[7:9],
                     #action_relative[9:12],
-                    action_relative[6:8],
+                    #action_relative[6:8],
+                    [0.0,0.0],
                     action_relative[8:11],
                 ]
             )
+            print(f"gr00t-command={action_relative[5]}")
             # 差分になっている行動を元に戻す
             action_notemp = action_notemp + np.concatenate(
                 [obs["joint_state"][:5], np.array([0]), obs["joint_state"][6:8], np.array([0, 0, 0])]
@@ -303,9 +327,10 @@ def main():
     print("Start Issac-GR00T")
 
     # TODO: 引数でいい感じに処理するようにする
-    checkpoint_dir = "/home/veluga-g3/airoa/ckpt/gr00t-050607"
+    # checkpoint_dir = "/home/veluga-g3/airoa/ckpt/stage1-submit"
+    checkpoint_dir = "/home/veluga-g3/airoa/ckpt/stage2-mid/050607-task"
     adopted_action_chunks = 32
-    use_temp_ensem = True
+    use_temp_ensem = False
 
     print(f"checkpoint_dir: {checkpoint_dir}")
     print(f"adopted_action_chunks: {adopted_action_chunks}")
