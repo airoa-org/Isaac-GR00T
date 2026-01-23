@@ -63,6 +63,8 @@ class BaseSampler(Sampler):
 class DualBrainTrainer(transformers.Trainer):
     def __init__(self, **kwargs):
         self.compute_dtype = kwargs.pop("compute_dtype")
+        self.lr_scheduler_factory = kwargs.pop("lr_scheduler_factory", None)
+        self.lr_scheduler_kwargs = kwargs.pop("lr_scheduler_kwargs", None) or {}
         super().__init__(**kwargs)
 
     def _get_train_sampler(self):
@@ -117,6 +119,36 @@ class DualBrainTrainer(transformers.Trainer):
             self.optimizer = optimizer_cls(optimizer_grouped_parameters, **optimizer_kwargs)
 
         return self.optimizer
+
+    def create_scheduler(self, num_training_steps: int, optimizer: Optional[torch.optim.Optimizer] = None):
+        if self.lr_scheduler is not None:
+            return self.lr_scheduler
+
+        if self.lr_scheduler_factory is None:
+            return super().create_scheduler(num_training_steps, optimizer)
+
+        opt = optimizer if optimizer is not None else self.optimizer
+        scheduler_specific_kwargs = {}
+        if self.lr_scheduler_kwargs:
+            scheduler_specific_kwargs.update(self.lr_scheduler_kwargs)
+        if not scheduler_specific_kwargs:
+            scheduler_specific_kwargs = None
+        num_warmup_steps = self.args.get_warmup_steps(num_training_steps)
+        try:
+            self.lr_scheduler = self.lr_scheduler_factory(
+                optimizer=opt,
+                num_warmup_steps=num_warmup_steps,
+                num_training_steps=num_training_steps,
+                scheduler_specific_kwargs=scheduler_specific_kwargs,
+            )
+            return self.lr_scheduler
+        except Exception as exc:
+            if self.is_world_process_zero():
+                print(
+                    f"[WARN] custom lr_scheduler failed, falling back to HF scheduler: {exc}",
+                    flush=True,
+                )
+            return super().create_scheduler(num_training_steps, optimizer)
 
     def save_model(self, output_dir: Optional[str], _internal_call: bool):
         ## save tuned model separately

@@ -115,7 +115,7 @@ wandb
 # Playground
 playground/
 
-# Hydra 
+# Hydra
 .hydra/
 
 # Data
@@ -132,4 +132,4 @@ subset_dataset*
 data/
 input/
 my_outputs/
-
+logs/

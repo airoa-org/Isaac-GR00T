@@ -20,12 +20,14 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Literal
+from typing import List, Literal, Optional
 import numpy as np
 import wandb
 import torch
 import tyro
 from transformers import TrainingArguments
+import json
+import importlib
 
 from gr00t.data.dataset import LeRobotMixtureDataset, LeRobotSingleDataset
 from gr00t.data.schema import EmbodimentTag
@@ -36,8 +38,7 @@ from gr00t.model.transforms import EMBODIMENT_TAG_MAPPING
 from gr00t.utils.peft import get_lora_model
 
 wandb.init(
-    project="gr00t",
-    entity="airoa-aist"
+    project="gr00t"
 )
 
 @dataclass
@@ -96,6 +97,25 @@ class ArgsConfig:
     warmup_ratio: float = 0.05
     """Ratio of total training steps used for warmup."""
 
+    lr_scheduler_backend: Literal["hf", "custom"] = "hf"
+    """Learning rate scheduler backend. 'hf' uses Transformers built-ins, 'custom' uses a user-provided factory."""
+
+    lr_scheduler_type: str = "cosine_with_restarts"
+    """Transformers lr_scheduler_type when lr_scheduler_backend='hf'."""
+
+    lr_scheduler_kwargs_json: str = "{\"num_cycles\": 3}"
+    """JSON string of kwargs for Transformers scheduler when lr_scheduler_backend='hf'."""
+
+    custom_lr_scheduler: Optional[str] = None
+    """Custom scheduler factory in 'module:function' form when lr_scheduler_backend='custom'.
+
+    Expected signature:
+    (optimizer, num_warmup_steps, num_training_steps, scheduler_specific_kwargs)
+    """
+
+    custom_lr_scheduler_kwargs_json: str = ""
+    """JSON string merged into scheduler_specific_kwargs for custom scheduler factory."""
+
     lora_rank: int = 0
     """Rank for the LORA model. If 0, no LORA will be used."""
 
@@ -134,6 +154,29 @@ class ArgsConfig:
     sample_every_n: int = None
 
     target_fps: float = None
+
+def _parse_json_kwargs(raw: Optional[str], label: str) -> dict:
+    if raw is None or raw == "":
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{label} must be valid JSON: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError(f"{label} must decode to a JSON object")
+    return parsed
+
+def _load_factory(spec: Optional[str]):
+    if spec is None or spec == "":
+        return None
+    if ":" not in spec:
+        raise ValueError("custom_lr_scheduler must be in 'module:function' format")
+    module_path, func_name = spec.split(":", 1)
+    module = importlib.import_module(module_path)
+    factory = getattr(module, func_name)
+    if not callable(factory):
+        raise ValueError(f"custom_lr_scheduler target is not callable: {spec}")
+    return factory
 
 def sanity_check(ds, include_episodes: set[int], max_print: int = 10):
     ids = set(map(int, ds.trajectory_ids.tolist()))
@@ -285,6 +328,31 @@ def main(config: ArgsConfig):
             action_head_only=not config.lora_full_model,
         )
 
+    hf_lr_scheduler_kwargs = _parse_json_kwargs(
+        config.lr_scheduler_kwargs_json, "lr_scheduler_kwargs_json"
+    )
+    lr_scheduler_factory = None
+    lr_scheduler_factory_kwargs = {}
+    if config.lr_scheduler_backend == "custom":
+        if not config.custom_lr_scheduler:
+            print(
+                "[WARN] custom lr_scheduler backend selected but no factory provided; falling back to HF scheduler.",
+                flush=True,
+            )
+        else:
+            try:
+                lr_scheduler_factory = _load_factory(config.custom_lr_scheduler)
+                lr_scheduler_factory_kwargs = _parse_json_kwargs(
+                    config.custom_lr_scheduler_kwargs_json, "custom_lr_scheduler_kwargs_json"
+                )
+            except Exception as exc:
+                print(
+                    f"[WARN] custom lr_scheduler setup failed, falling back to HF scheduler: {exc}",
+                    flush=True,
+                )
+                lr_scheduler_factory = None
+                lr_scheduler_factory_kwargs = {}
+
     # 2.1 modify training args
     training_args = TrainingArguments(
         output_dir=config.output_dir,
@@ -306,7 +374,8 @@ def main(config: ArgsConfig):
         learning_rate=config.learning_rate,
         weight_decay=config.weight_decay,
         warmup_ratio=config.warmup_ratio,
-        lr_scheduler_type="cosine",
+        lr_scheduler_type=config.lr_scheduler_type,
+        lr_scheduler_kwargs=hf_lr_scheduler_kwargs,
         logging_steps=10.0,
         num_train_epochs=300,
         max_steps=config.max_steps,
@@ -328,6 +397,8 @@ def main(config: ArgsConfig):
         model=model,
         training_args=training_args,
         resume_from_checkpoint=config.resume,
+        lr_scheduler_factory=lr_scheduler_factory,
+        lr_scheduler_kwargs=lr_scheduler_factory_kwargs,
     )
 
     # 2.3 run experiment
