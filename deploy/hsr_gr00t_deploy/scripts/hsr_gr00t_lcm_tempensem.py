@@ -153,6 +153,8 @@ class Gr00tHSRPolicy:
         self.use_temp_ensem = use_temp_ensem          # 無効にしたい時は False
         self.temporal_half_life = 8        # フレーム半減期(=約10ステップで重み半減)
         self._ema_action = None
+        self.base_scale = 1.1
+        self.lift_scale = 1.0
 
     
         self.max_timesteps = 10000
@@ -198,6 +200,7 @@ class Gr00tHSRPolicy:
                 for _ in range(self.num_traj):
                     action_relative = self.action_queue["action.relative"].popleft()
                     #action_relative = self.actions_rel[self.frame_num]
+                    
                     action = np.concatenate(
                         [
                             action_relative[0:5],
@@ -205,8 +208,8 @@ class Gr00tHSRPolicy:
                             #action_relative[7:9],
                             #action_relative[9:12],
                             #action_relative[6:8],
-                            [0.0, 0.0],
-                            action_relative[8:11],
+                            [0.0, action_relative[7]],
+                            action_relative[8:11] * self.base_scale,
                         ]
                     )
                     self.frame_num += 1
@@ -242,14 +245,15 @@ class Gr00tHSRPolicy:
         actions_notemp = []
         for i in range(len(action_chunk["action.relative"])):
             action_relative = action_chunk["action.relative"][i]
+            action_relative[0] = action_relative[0] * self.lift_scale
             action = np.concatenate(
                 [
                     action_relative[0:5],
                     [action_relative[5]],
                     #[0.5],
                     #action_relative[6:8],
-                    [0.0, 0.0],
-                    action_relative[8:11],
+                    [0.0, action_relative[7]],
+                    action_relative[8:11] * self.base_scale,
                 ]
             )
 
@@ -279,6 +283,7 @@ class Gr00tHSRPolicy:
             self.action_queue["action.relative"].extend(action_chunk["action.relative"][self.num_traj:self.adopted_action_chunks])
             action_relative = self.action_queue["action.relative"].popleft()
             #action_relative = self.actions_rel[self.frame_num]
+            action_relative[0] = action_relative[0] * self.lift_scale
             action_notemp = np.concatenate(
                 [
                     action_relative[0:5],
@@ -287,8 +292,8 @@ class Gr00tHSRPolicy:
                     #action_relative[7:9],
                     #action_relative[9:12],
                     #action_relative[6:8],
-                    [0.0, 0.0],
-                    action_relative[8:11],
+                    [0.0, action_relative[7]],
+                    action_relative[8:11] * self.base_scale,
                 ]
             )
             # 差分になっている行動を元に戻す
@@ -297,7 +302,7 @@ class Gr00tHSRPolicy:
             )
             actions_notemp.append(action)
 
-            return np.array(actions)
+            return np.array(actions_notemp)
 
         
 
@@ -306,8 +311,8 @@ def main():
     print("Start Issac-GR00T")
 
     # TODO: 引数でいい感じに処理するようにする
-    checkpoint_dir = "s3://airoa-fm-development-competition/group6/st2-mid-checkpoint"
-    adopted_action_chunks = 32
+    checkpoint_dir = "/home/hsr_pc4/group6/ckpt/group123-2000-chunk16"
+    adopted_action_chunks = 16
     use_temp_ensem = False
 
     print(f"checkpoint_dir: {checkpoint_dir}")
